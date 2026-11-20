@@ -3476,6 +3476,7 @@ dependencies = [
  "futures-util",
  "hex",
  "keyring",
+ "log",
  "mdns-sd",
  "nsh-base",
  "nsh-core",

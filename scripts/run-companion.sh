@@ -3,8 +3,16 @@ set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_dir"
 cargo build -p wave-companion --bin wave-companion
+identity="${WAVE_SIGN_IDENTITY:-6491898B04D58BFDC11BE20B3A60C9FA23973B59}"
 bundle="$project_dir/target/debug/Wave Companion.app"
 mkdir -p "$bundle/Contents/MacOS"
+if [ -f "$bundle/Contents/MacOS/wave-companion" ] &&
+   [ "$(shasum -a 256 "$project_dir/target/debug/wave-companion" | cut -d ' ' -f1)" = "$(cat "$project_dir/target/debug/companion-build-hash" 2>/dev/null || true)" ] &&
+   [ "$(cat "$project_dir/target/debug/companion-signing-identity" 2>/dev/null || true)" = "$identity" ] &&
+   codesign --verify --strict "$bundle" 2>/dev/null; then
+    [ "${WAVE_PACKAGE_ONLY:-0}" = 1 ] || open "$bundle"
+    exit 0
+fi
 cp "$project_dir/target/debug/wave-companion" "$bundle/Contents/MacOS/wave-companion"
 cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -21,5 +29,7 @@ cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <key>NSBonjourServices</key><array><string>_stadia-wave._tcp</string></array>
 </dict></plist>
 PLIST
-codesign --force --sign - "$bundle"
-open "$bundle"
+codesign --force --sign "$identity" "$bundle"
+shasum -a 256 "$project_dir/target/debug/wave-companion" | cut -d ' ' -f1 > "$project_dir/target/debug/companion-build-hash"
+printf '%s\n' "$identity" > "$project_dir/target/debug/companion-signing-identity"
+[ "${WAVE_PACKAGE_ONLY:-0}" = 1 ] || open "$bundle"

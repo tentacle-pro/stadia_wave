@@ -11,7 +11,20 @@ use nsh_platform_windows as platform;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn main() -> impl std::process::Termination {
-    env_logger::init();
+    let mut logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    if let Some(dirs) = directories::ProjectDirs::from("dev", "stadiawave", "companion") {
+        let directory = dirs.data_dir().join("logs");
+        if std::fs::create_dir_all(&directory).is_ok()
+            && let Ok(file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(directory.join(format!("{}.log", uuid::Uuid::new_v4())))
+        {
+            logger.target(env_logger::Target::Pipe(Box::new(file)));
+        }
+    }
+    logger.init();
     platform::run_app(
         platform::AppSource::Rust(platform::Root::of::<wave_companion::App>()),
         platform::AppOptions {

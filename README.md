@@ -97,3 +97,15 @@ cargo run -p wave-companion --example recording_takeover -- /absolute/path/to/pa
 本机 ASR 使用 `GET /v1/models` 选择唯一模型，并通过 `POST /v1/audio/transcriptions` 发送转成单声道、16 kHz PCM WAV 的录音。可用 `WAVE_ASR_URL`、`WAVE_ASR_LANGUAGE` 和 `WAVE_ASR_MODEL` 覆盖设置。若 FFmpeg 不在 Homebrew 常用目录或 `PATH` 中，可设置 `WAVE_FFMPEG` 为绝对路径。
 
 服务不可用时，修改地址后点「重试转写」即可使用原录音。Companion 同时保留一份待处理草稿。在它处理完之前收到的新录音仍会保存，可通过「打开录音」播放。
+
+## 日常运行和恢复
+
+Companion 保存所选 Bridge、是否自动连接、ASR 地址和语言。重新打开后通过 Bonjour 找到保存的 Bridge，自动连接只使用空闲服务。点击「连接」可以主动接管，点击「断开」同时关闭下次启动的自动连接。网络连接中断后使用退避重试并刷新发现地址。连接心跳跳过睡眠期间错过的 tick。
+
+Stadiacast 退出后，Bridge 取消未完成录音并延迟重启子进程。重试间隔最高 30 秒，每次使用独立日志目录。手柄和原 Companion 会话继续等待新进程就绪。已保存的历史录音在重启时不会扫描或自动转写，粘贴动作始终需要当前草稿的确认。
+
+通过 `./scripts/run-bridge.sh` 启动 Bridge，可将输出保存到 Bridge 数据目录的 logs。Companion 每次启动的诊断日志保存在其数据目录的 logs。Stadiacast 的结构化事件及 stdout/stderr 位于 Bridge 的 captures 中。日志和录音目前由用户手动清理。
+
+开发脚本默认使用当前机器的 Apple Development 身份签名，可用 `WAVE_SIGN_IDENTITY` 覆盖。二进制和签名身份均未变化时直接打开已有应用。换用开发者身份后可能需要刷新一次系统授权。运行 `./scripts/package-macos.sh` 生成 release 版 Companion.app 和 Bridge，输出到 target/macos。此包用于本机开发使用，尚未进行公证。
+
+睡眠唤醒和真实网络切换会影响手柄到 Bridge 的连接。Bridge 固定 IP 或路由器 DHCP DNS 发生变化时，仍需同步用户的网络配置。

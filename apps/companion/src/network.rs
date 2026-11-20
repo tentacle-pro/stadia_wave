@@ -72,6 +72,9 @@ pub struct ReceivedRecording {
 }
 
 pub enum Command {
+    Restore {
+        bridge: Bridge,
+    },
     Connect {
         bridge: Bridge,
         invitation_path: String,
@@ -189,6 +192,11 @@ async fn run(
                     waiting = false;
                     retry_delay = 1;
                 }
+                Some(Command::Restore { bridge }) => {
+                    target = Some((bridge, String::new()));
+                    takeover = false;
+                    waiting = false;
+                }
                 Some(Command::Rumble { .. }) => continue,
                 Some(Command::Disconnect) => {
                     state.lock().unwrap().status = "已断开".into();
@@ -206,6 +214,7 @@ async fn run(
                             takeover = true;
                             retry_delay = 1;
                         }
+                        Some(Command::Restore { .. }) => continue,
                         Some(Command::Rumble { .. }) => continue,
                         Some(Command::Disconnect) => {
                             target = None;
@@ -276,6 +285,10 @@ async fn run(
                         view.status = "已断开".into();
                     }
                     None => break 'coordinator,
+                    Some(Command::Restore { bridge }) => {
+                        target = Some((bridge, String::new()));
+                        takeover = false;
+                    }
                     Some(Command::Rumble { .. }) => unreachable!(),
                 }
                 waiting = false;
@@ -293,6 +306,7 @@ async fn run(
         clear_recording(&mut view, dictation.as_ref());
         view.hardware = HardwareState::default();
         view.retrying = false;
+        log::info!("Connection ended; evaluating recovery");
         match result {
             Ok(Ok(Exit::Retry(message))) => {
                 view.status = format!("连接中断，正在重连：{message}");
@@ -428,6 +442,7 @@ async fn session(
     let outcome: Result<Exit> = async {
         socket.send(Message::Text(serde_json::to_string(&auth)?.into())).await?;
         let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_received = tokio::time::Instant::now();
         let mut current_session: Option<String> = None;
         let mut incoming_audio: Option<IncomingAudio> = None;
@@ -474,7 +489,7 @@ async fn session(
                                 state.session_id = Some(session_id);
                                 state.heartbeats = 0;
                                 state.status = format!("已连接 {} · WSS 已认证", bridge.name);
-                                println!("CONNECTED {} via {}:{}", bridge.id, bridge.address, bridge.port);
+                                log::info!("CONNECTED {} via {}:{}", bridge.id, bridge.address, bridge.port);
                             }
                             ServerMessage::Status { .. } => {}
                             ServerMessage::Hardware { session_id, snapshot } if current_session.as_ref() == Some(&session_id) => {
@@ -515,7 +530,7 @@ async fn session(
                                 | ServerMessage::RecordingCancelled { .. } | ServerMessage::Audio { .. } | ServerMessage::CommandResult { .. } => {}
                             ServerMessage::Pong { session_id, .. } if current_session.as_ref() == Some(&session_id) => {
                                 state.lock().unwrap().heartbeats += 1;
-                                println!("PONG");
+                                log::debug!("PONG");
                             }
                             ServerMessage::Pong { .. } => {}
                             ServerMessage::Replaced => return Ok(Exit::Replaced),

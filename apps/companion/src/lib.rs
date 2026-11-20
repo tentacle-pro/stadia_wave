@@ -38,7 +38,9 @@ pub fn App() -> impl IntoElement {
     let dictation_notice = signal(String::new());
     let poll = dictation.clone();
     let model = signal(network::ViewState::default());
-    let selected = signal(String::new());
+    let selected = signal(Storage::get_item("bridge.selected").unwrap_or_default());
+    let auto_connect = signal(Storage::get_item("bridge.autoconnect").as_deref() == Some("true"));
+    let reconnect = worker.commands.clone();
     let path = signal(String::new());
     let shared = worker.state;
     set_interval(Duration::from_millis(150), move || {
@@ -47,6 +49,17 @@ pub fn App() -> impl IntoElement {
             let (draft, notice) = poll.update_desktop(view.active_bridge.as_deref());
             (view.clone(), draft, notice)
         };
+        if auto_connect.get()
+            && let Some(bridge) = next
+                .bridges
+                .iter()
+                .find(|bridge| bridge.id == selected.get())
+        {
+            let _ = reconnect.send(network::Command::Restore {
+                bridge: bridge.clone(),
+            });
+            auto_connect.set(false);
+        }
         let draft_value = draft
             .as_ref()
             .map(|draft| draft.text.as_str())
@@ -193,7 +206,10 @@ pub fn App() -> impl IntoElement {
                             button()
                                 .p_3()
                                 .bg(move || if selected.get() == id { theme().secondary } else { theme().background })
-                                .on_press(move || selected.set(bridge.id.clone()))
+                                .on_press(move || {
+                                    let _ = Storage::set_item("bridge.selected", bridge.id.clone());
+                                    selected.set(bridge.id.clone());
+                                })
                                 .child(text(format!("{}  ·  {}:{}", bridge.name, bridge.address, bridge.port)))
                         }).collect::<Vec<_>>()
                     }))
@@ -211,11 +227,12 @@ pub fn App() -> impl IntoElement {
                         .child(button().p_3().bg(move || theme().primary)
                             .on_press(move || {
                                 if let Some(bridge) = model.get().bridges.into_iter().find(|bridge| bridge.id == selected.get()) {
+                                    let _ = Storage::set_item("bridge.autoconnect", "true");
                                     let _ = connect.send(network::Command::Connect { bridge, invitation_path: path.get() });
                                 }
                             })
                             .child(text("连接").text_color(move || theme().primary_foreground)))
-                        .child(button().p_3().on_press(move || { let _ = disconnect.send(network::Command::Disconnect); }).child(text("断开"))))
+                        .child(button().p_3().on_press(move || { let _ = Storage::set_item("bridge.autoconnect", "false"); auto_connect.set(false); let _ = disconnect.send(network::Command::Disconnect); }).child(text("断开"))))
                     .child(text(move || format!("已确认的心跳  {}", model.get().heartbeats)).text_size(px(13.0)))
             )
         )

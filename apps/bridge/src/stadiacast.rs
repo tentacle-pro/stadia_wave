@@ -68,38 +68,10 @@ impl Handle {
         fs::create_dir_all(&run_dir)?;
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700))?;
-        let child = if let Some(options) = options {
-            println!("Stadiacast run directory: {}", run_dir.display());
-            let stdout = File::create(run_dir.join("stdout.log"))?;
-            let stderr = File::create(run_dir.join("stderr.log"))?;
-            Some(
-                Command::new(&options.executable)
-                    .args([
-                        "--preset",
-                        "live",
-                        "--dns-upstream",
-                        &options.dns_upstream,
-                        "--controller-ip",
-                        &options.controller_ip,
-                        "--advertise-ip",
-                        &options.advertise_ip,
-                        "--mic",
-                        "off",
-                        "--mic-record",
-                        "--start-game",
-                        "--log-dir",
-                    ])
-                    .arg(&run_dir)
-                    .stdin(Stdio::null())
-                    .stdout(stdout)
-                    .stderr(stderr)
-                    .kill_on_drop(true)
-                    .spawn()
-                    .context("无法启动 Stadiacast")?,
-            )
-        } else {
-            None
-        };
+        let child = options
+            .as_ref()
+            .map(|options| launch(options, &run_dir))
+            .transpose()?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .no_proxy()
@@ -107,6 +79,9 @@ impl Handle {
         tokio::spawn(
             Actor {
                 child,
+                options,
+                restart_at: Instant::now(),
+                restart_delay: 1,
                 run_dir,
                 client,
                 owner: None,
@@ -182,6 +157,34 @@ impl Handle {
     }
 }
 
+fn launch(options: &Options, run_dir: &Path) -> Result<Child> {
+    let stdout = File::create(run_dir.join("stdout.log"))?;
+    let stderr = File::create(run_dir.join("stderr.log"))?;
+    Command::new(&options.executable)
+        .args([
+            "--preset",
+            "live",
+            "--dns-upstream",
+            &options.dns_upstream,
+            "--controller-ip",
+            &options.controller_ip,
+            "--advertise-ip",
+            &options.advertise_ip,
+            "--mic",
+            "off",
+            "--mic-record",
+            "--start-game",
+            "--log-dir",
+        ])
+        .arg(run_dir)
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .kill_on_drop(true)
+        .spawn()
+        .context("无法启动 Stadiacast")
+}
+
 struct Owner {
     session: String,
     events: mpsc::Sender<Event>,
@@ -196,6 +199,9 @@ struct Recording {
 
 struct Actor {
     child: Option<Child>,
+    options: Option<Options>,
+    restart_at: Instant,
+    restart_delay: u64,
     run_dir: PathBuf,
     client: reqwest::Client,
     owner: Option<Owner>,
@@ -363,6 +369,33 @@ impl Actor {
     }
 
     async fn poll(&mut self) {
+        if self.child.is_none()
+            && Instant::now() >= self.restart_at
+            && let Some(options) = &self.options
+        {
+            let directory = self
+                .run_dir
+                .parent()
+                .unwrap()
+                .join(Uuid::new_v4().to_string());
+            let result = fs::create_dir(&directory)
+                .map_err(anyhow::Error::from)
+                .and_then(|_| launch(options, &directory));
+            self.restart_at = Instant::now() + Duration::from_secs(self.restart_delay);
+            self.restart_delay = (self.restart_delay * 2).min(30);
+            match result {
+                Ok(child) => {
+                    self.run_dir = directory;
+                    self.log = None;
+                    self.partial_line.clear();
+                    self.child = Some(child);
+                }
+                Err(error) => {
+                    self.snapshot.message = format!("Stadiacast 重启失败，将重试：{error:#}");
+                    self.publish_snapshot();
+                }
+            }
+        }
         let Some(child) = &mut self.child else { return };
         match child.try_wait() {
             Ok(Some(code)) => {
@@ -383,7 +416,15 @@ impl Actor {
                     ),
                     controllers: vec![],
                 });
+                let owner = self.owner.as_ref().map(|owner| Owner {
+                    session: owner.session.clone(),
+                    events: owner.events.clone(),
+                });
                 self.clear_owner().await;
+                self.owner = owner;
+                self.enabled.clear();
+                self.recordings.clear();
+                self.restart_at = Instant::now() + Duration::from_secs(self.restart_delay);
                 self.child = None;
                 return;
             }
@@ -687,6 +728,9 @@ mod tests {
         fs::create_dir_all(&run_dir).unwrap();
         Actor {
             child: None,
+            options: None,
+            restart_at: Instant::now(),
+            restart_delay: 1,
             run_dir,
             client: reqwest::Client::new(),
             owner: None,
@@ -698,6 +742,31 @@ mod tests {
             snapshot: HardwareState::default(),
             verified: false,
         }
+    }
+
+    #[tokio::test]
+    async fn crashed_process_is_restarted_without_replaying_recording() {
+        let mut actor = actor();
+        let original = actor.run_dir.clone();
+        actor.options = Some(Options {
+            executable: "/usr/bin/false".into(),
+            controller_ip: "127.0.0.1".into(),
+            advertise_ip: "127.0.0.1".into(),
+            dns_upstream: "127.0.0.1".into(),
+        });
+        actor.poll().await;
+        let first = actor.child.as_ref().unwrap().id();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        actor.poll().await;
+        assert!(actor.child.is_none());
+        assert!(actor.recordings.is_empty());
+        actor.restart_at = Instant::now();
+        actor.poll().await;
+        assert_ne!(actor.child.as_ref().unwrap().id(), first);
+        assert_ne!(actor.run_dir, original);
+        actor.stop().await;
+        let _ = fs::remove_dir_all(actor.run_dir);
+        let _ = fs::remove_dir_all(original);
     }
 
     #[tokio::test]
