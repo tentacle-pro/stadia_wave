@@ -1,0 +1,35 @@
+[package]
+name = "wave-companion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "wave-companion"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+mdns-sd.workspace = true
+uuid.workspace = true
+futures-util.workspace = true
+directories.workspace = true
+wave-protocol.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rustls-pemfile = "2"
+keyring = { version = "3", features = ["apple-native"] }
+nsh-core = "0.6.0"
+nsh-base = "0.6.0"
+env_logger = "0.11"
+reqwest.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nsh-platform-macos = { version = "0.6.0", default-features = false }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSWorkspace", "NSRunningApplication", "NSPasteboard", "libc"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSString"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGEvent", "CGEventTypes", "CGEventSource", "CGRemoteOperation", "libc"] }
