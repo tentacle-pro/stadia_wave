@@ -72,6 +72,21 @@ fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn bundled_stadiacast() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let helpers = executable.parent()?;
+    let contents = helpers.parent()?;
+    let app = contents.parent()?;
+    if helpers.file_name()? != "Helpers"
+        || contents.file_name()? != "Contents"
+        || app.extension()? != "app"
+    {
+        return None;
+    }
+    let runtime = helpers.join("stadiacast");
+    runtime.is_file().then_some(runtime)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
@@ -181,7 +196,11 @@ async fn main() -> Result<()> {
         private_write(&config_path, &serde_json::to_vec_pretty(&options)?)?;
         Some(options)
     } else if config_path.exists() {
-        Some(serde_json::from_slice(&fs::read(&config_path)?)?)
+        let mut options: stadiacast::Options = serde_json::from_slice(&fs::read(&config_path)?)?;
+        if let Some(runtime) = bundled_stadiacast() {
+            options.executable = runtime;
+        }
+        Some(options)
     } else {
         None
     };
@@ -196,9 +215,11 @@ async fn main() -> Result<()> {
     }));
     let admission = Arc::new(Mutex::new(()));
     let mut tasks = tokio::task::JoinSet::new();
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
+            _ = terminate.recv() => break,
             incoming = listener.accept() => {
                 let (stream, peer) = incoming?;
                 let acceptor = acceptor.clone();

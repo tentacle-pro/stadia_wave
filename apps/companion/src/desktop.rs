@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail, ensure};
-use objc2::rc::autoreleasepool;
+use objc2::{MainThreadMarker, rc::autoreleasepool};
 use objc2_app_kit::{
-    NSApplicationActivationOptions, NSPasteboard, NSPasteboardTypeString, NSRunningApplication,
-    NSWorkspace,
+    NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy, NSPasteboard,
+    NSPasteboardTypeString, NSRunningApplication, NSWorkspace,
 };
 use objc2_core_graphics::{CGEvent, CGEventFlags};
 use objc2_foundation::NSString;
@@ -32,6 +32,24 @@ pub fn frontmost_target() -> Option<Target> {
             name: app.localizedName()?.to_string(),
         })
     })
+}
+
+pub fn set_dock_visible(visible: bool) {
+    dispatch2::DispatchQueue::main().exec_async(move || {
+        let app = NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
+        let policy = if visible {
+            NSApplicationActivationPolicy::Regular
+        } else {
+            NSApplicationActivationPolicy::Accessory
+        };
+        if app.activationPolicy() != policy && !app.setActivationPolicy(policy) {
+            log::warn!("AppKit refused to change the Dock visibility");
+        }
+    });
+}
+
+pub fn authorized() -> bool {
+    unsafe { AXIsProcessTrusted() }
 }
 
 pub fn copy(text: &str) -> Result<()> {
@@ -92,5 +110,97 @@ impl Target {
             CGEvent::post_to_pid(self.pid, Some(event));
         }
         Ok(true)
+    }
+}
+
+// Mapping events share one output-key state so held modifiers accompany mouse
+// movement and repeated keyboard events consistently.
+#[cfg(not(test))]
+pub fn mapping_key(code: u16, down: bool, held: &std::collections::BTreeSet<u16>) {
+    use objc2_core_graphics::CGEventTapLocation;
+    if let Some(event) = CGEvent::new_keyboard_event(None, code, down) {
+        let mut flags = CGEventFlags::empty();
+        // AppKit identifies arrow/navigation keys with the secondary Fn flag.
+        // System symbolic shortcuts include that flag when matching arrows.
+        if matches!(code, 115..=117 | 119 | 121 | 123..=126) {
+            flags |= CGEventFlags::MaskSecondaryFn;
+        }
+        for (key, flag) in [
+            (55, CGEventFlags::MaskCommand),
+            (56, CGEventFlags::MaskShift),
+            (58, CGEventFlags::MaskAlternate),
+            (59, CGEventFlags::MaskControl),
+        ] {
+            if (held.contains(&key) && (key != code || down)) || (key == code && down) {
+                flags |= flag;
+            }
+        }
+        CGEvent::set_flags(Some(&event), flags);
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+    }
+}
+#[cfg(not(test))]
+pub fn mapping_mouse_button(button: usize, down: bool) {
+    use objc2_core_graphics::{CGEventTapLocation, CGEventType, CGMouseButton};
+    if let Some(current) = CGEvent::new(None) {
+        if let Some(event) = CGEvent::new_mouse_event(
+            None,
+            match (button, down) {
+                (0, true) => CGEventType::LeftMouseDown,
+                (0, false) => CGEventType::LeftMouseUp,
+                (_, true) => CGEventType::RightMouseDown,
+                (_, false) => CGEventType::RightMouseUp,
+            },
+            CGEvent::location(Some(&current)),
+            if button == 0 {
+                CGMouseButton::Left
+            } else {
+                CGMouseButton::Right
+            },
+        ) {
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+        }
+    }
+}
+#[cfg(not(test))]
+pub fn mapping_move(dx: f64, dy: f64, buttons: [bool; 2]) {
+    use objc2_core_graphics::{CGEventTapLocation, CGEventType, CGMouseButton};
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    if let Some(current) = CGEvent::new(None) {
+        let mut point = CGEvent::location(Some(&current));
+        point.x += dx;
+        point.y += dy;
+        if let Some(event) = CGEvent::new_mouse_event(
+            None,
+            if buttons[0] {
+                CGEventType::LeftMouseDragged
+            } else if buttons[1] {
+                CGEventType::RightMouseDragged
+            } else {
+                CGEventType::MouseMoved
+            },
+            point,
+            if buttons[1] && !buttons[0] {
+                CGMouseButton::Right
+            } else {
+                CGMouseButton::Left
+            },
+        ) {
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+        }
+    }
+}
+#[cfg(not(test))]
+pub fn mapping_scroll(dx: i32, dy: i32) {
+    use objc2_core_graphics::{CGEventTapLocation, CGScrollEventUnit};
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    if let Some(event) =
+        CGEvent::new_scroll_wheel_event2(None, CGScrollEventUnit::Pixel, 2, dy, dx, 0)
+    {
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
     }
 }

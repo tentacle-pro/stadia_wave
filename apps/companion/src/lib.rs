@@ -1,12 +1,20 @@
 mod asr;
 mod desktop;
 mod dictation;
+mod local_bridge;
+mod mapping;
+mod mapping_page;
 pub mod network;
+mod pages;
+mod statistics;
 
-use nsh_base::{button, theme};
-use nsh_core::desktop::{WindowAttributes, WindowKind};
-use nsh_core::element::desktop::window as desktop_window;
-use nsh_core::element::input;
+use base64::Engine;
+use nsh_base::button;
+use nsh_core::desktop::{WindowAttributes, WindowKind, WindowPosition};
+use nsh_core::element::desktop::{
+    MenuItem, current_window, on_app_quit, quit, set_tray, tray, window as desktop_window,
+};
+use nsh_core::element::{ImageSrc, image};
 use nsh_core::prelude::*;
 use nsh_core::storage::Storage;
 
@@ -19,6 +27,59 @@ fn native(registry: &mut Registry) {
 
 #[component]
 pub fn App() -> impl IntoElement {
+    let preview_position = nsh_core::element::desktop::displays()
+        .into_iter()
+        .find(|display| display.primary)
+        .map(|display| {
+            WindowPosition::At(Point::new(
+                display.visible_bounds.origin.x
+                    + (display.visible_bounds.size.width - px(560.0)) / 2.0,
+                display.visible_bounds.origin.y,
+            ))
+        })
+        .unwrap_or(WindowPosition::Center);
+    let page = signal(0usize);
+    let mapping_dirty = signal(false);
+    let mapping_notice = signal(String::new());
+    let update_notice = signal(String::new());
+    let main_window = current_window();
+    let mut window_options = WindowAttributes::default();
+    window_options.close_on_press = Some(false);
+    main_window.set(window_options);
+    let hide_window = main_window.clone();
+    main_window.on_close_press(move |_| hide_window.hide());
+    let dock_visible = computed({
+        let main_window = main_window.clone();
+        move || {
+            main_window
+                .state()
+                .is_none_or(|state| state.visible || state.minimized)
+        }
+    });
+    effect(move || desktop::set_dock_visible(dock_visible.get()));
+    on_app_quit(|| async {
+        mapping::pause(true);
+        let (done, result) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(local_bridge::stop());
+        });
+        match result.await {
+            Ok(Ok(())) => {}
+            result => log::warn!("Could not stop the local Bridge on quit: {result:?}"),
+        }
+    });
+    let show_window = main_window.clone();
+    let tray_png =
+        base64::engine::general_purpose::STANDARD.encode(include_bytes!("../assets/menubar.png"));
+    let wave_mark = ImageSrc::from(format!("data:image/png;base64,{tray_png}"));
+    let about_mark = wave_mark.clone();
+    set_tray(tray().icon(wave_mark.clone()).tooltip("Stadia Wave").menu([
+        MenuItem::new("打开 Wave Companion").on_select(move || {
+            desktop::set_dock_visible(true);
+            show_window.focus();
+        }),
+        MenuItem::new("退出 Stadia Wave").on_select(quit),
+    ]));
     let endpoint = signal(
         std::env::var("WAVE_ASR_URL")
             .ok()
@@ -43,6 +104,7 @@ pub fn App() -> impl IntoElement {
     let reconnect = worker.commands.clone();
     let path = signal(String::new());
     let shared = worker.state;
+    mapping::start(shared.clone(), dictation.clone());
     set_interval(Duration::from_millis(150), move || {
         let (next, draft, notice) = {
             let view = shared.lock().unwrap();
@@ -84,224 +146,256 @@ pub fn App() -> impl IntoElement {
             model.set(next);
         }
     });
-    let connect = worker.commands.clone();
+    let settings_commands = worker.commands.clone();
     let rumble = worker.commands.clone();
-    let disconnect = worker.commands;
     view()
         .flex_1()
-        .bg(move || theme().background)
-        .text_color(move || theme().foreground)
-        .child(desktop_window()
-            .id("dictation-preview")
-            .kind(WindowKind::Panel)
-            .title("Stadia Wave")
-            .default_size(Size::new(px(440.0), px(240.0)))
-            .attributes({
-                let mut attributes = WindowAttributes::default();
-                attributes.activate = Some(false);
-                attributes.focusable = Some(false);
-                attributes.resizable = Some(false);
-                attributes.closable = Some(false);
-                attributes
-            })
-            .open(move || panel.get().is_some() || model.get().recording.is_some())
-            .content({
-                let actions = dictation.clone();
-                move || {
-                    let paste = actions.clone();
-                    let discard = actions.clone();
-                    view().p_4().gap_3()
-                        .bg(move || theme().background)
-                        .text_color(move || theme().foreground)
-                        .child(text(move || match panel.get() {
-                            Some((_, dictation::Phase::Ready, _)) => "A 粘贴 · B 丢弃",
-                            Some((_, dictation::Phase::Error(_), _)) => "转写失败 · 可在主窗口重试",
-                            Some(_) => "正在转写…",
-                            None => "正在录音…",
-                        }).text_size(px(16.0)))
-                        .child(scroll().flex_1().child(text(move || match panel.get() {
-                            Some((_, dictation::Phase::Error(error), _)) => error,
-                            _ => draft_text.get(),
-                        })))
-                        .child(text(move || dictation_notice.get()).text_size(px(12.0)))
-                        .child(view().flex_row().gap_3()
-                            .child(button().p_2().on_press(move || {
-                                if let Some((id, _, _)) = panel.get() { paste.confirm(&id); }
-                            }).child(text("粘贴")))
-                            .child(button().p_2().on_press(move || {
-                                if let Some((id, _, _)) = panel.get() { discard.discard(&id); }
-                            }).child(text("丢弃")))
-                            .child(text("编辑草稿请切回 Companion").text_size(px(12.0))))
-                }
-            }))
+        .bg(rgb(pages::SURFACE))
+        .text_color(rgb(pages::INK))
         .child(
-            scroll().flex_1().child(
-                view().p_6().gap_4()
-                    .child(text("Wave Companion").text_size(px(28.0)))
-                    .child(text(move || model.get().status).text_size(px(15.0)))
-                    .child(text(move || model.get().hardware.message).text_size(px(14.0)))
-                    .child(dynamic(move || {
-                        let commands = rumble.clone();
-                        model.get().hardware.controllers.into_iter().map(move |controller| {
-                            let commands = commands.clone();
-                            let label = format!("{} · {} · 电量 {}",
-                                controller.id,
-                                if controller.ready { "已就绪" } else { "等待连接" },
-                                controller.battery_percent.map(|v| format!("{v}%")).unwrap_or_else(|| "未知".into()));
-                            view().gap_2()
-                                .child(text(label))
-                                .child(button().p_2()
-                                    .on_press(move || { let _ = commands.send(network::Command::Rumble { controller: controller.id.clone() }); })
-                                    .child(text("测试震动")))
-                        }).collect::<Vec<_>>()
-                    }))
-                    .child(text(move || model.get().input).text_size(px(13.0)))
-                    .child(text(move || if model.get().recording.is_some() {
-                        "正在录音，松开 Assistant 结束"
-                    } else { "按住 Assistant 说话，等手柄灯闪后开始。" }).text_size(px(14.0)))
-                    .child(text(move || dictation_notice.get()).text_size(px(14.0)))
-                    .child(dynamic({
-                        let dictation = dictation.clone();
-                        move || panel.get().map(|(id, phase, target)| render_draft(dictation.clone(), id, phase, target, draft_text))
-                    }))
-                    .child(text(move || model.get().command_result).text_size(px(13.0)))
-                    .child(dynamic(move || {
-                        model.get().audio.map(|audio| {
-                            let path = audio.path.clone();
-                            view().gap_2()
-                                .child(text(format!("已收到录音 · {:.2} 秒", audio.seconds)))
-                                .child(button().p_2().on_press(move || {
-                                    let path = path.clone();
-                                    spawn(async move { let _ = open_path(path).await; });
-                                }).child(text("打开录音")))
-                        })
-                    }))
-                    .child(text("本机语音识别").text_size(px(18.0)))
-                    .child(input().value(move || endpoint.get()).h(px(38.0)).p_2()
-                        .placeholder("http://127.0.0.1:58078")
-                        .on_change({
-                            let dictation = dictation.clone();
-                            move |value: &str| {
-                                endpoint.set(value.to_owned());
-                                dictation.endpoint(value.to_owned());
-                                if asr::local_endpoint(value).is_ok() {
-                                    let _ = Storage::set_item("asr.endpoint", value.trim());
-                                }
-                            }
-                        }))
-                    .child(view().flex_row().gap_3()
-                        .child(text("识别语言").text_size(px(13.0)))
-                        .child(input().value(move || language.get()).h(px(32.0)).w(px(160.0)).p_2()
-                            .placeholder("留空自动识别")
-                            .on_change(move |value: &str| {
-                                language.set(value.to_owned());
-                                dictation.language(value.to_owned());
-                                let _ = Storage::set_item("asr.language", value.trim());
-                            })))
-                    .child(text("Voxt 重启后端口可能变化。").text_size(px(13.0)))
-                    .child(text("局域网中的 Bridge").text_size(px(18.0)))
-                    .child(dynamic(move || {
-                        model.get().bridges.into_iter().map(move |bridge| {
-                            let id = bridge.id.clone();
-                            button()
-                                .p_3()
-                                .bg(move || if selected.get() == id { theme().secondary } else { theme().background })
-                                .on_press(move || {
-                                    let _ = Storage::set_item("bridge.selected", bridge.id.clone());
-                                    selected.set(bridge.id.clone());
+            desktop_window()
+                .id("dictation-preview")
+                .kind(WindowKind::Panel)
+                .title("Stadia Wave")
+                .default_size(Size::new(px(560.0), px(230.0)))
+                .default_position(preview_position)
+                .attributes({
+                    let mut attributes = WindowAttributes::default();
+                    attributes.activate = Some(false);
+                    attributes.focusable = Some(false);
+                    attributes.resizable = Some(false);
+                    attributes.closable = Some(false);
+                    attributes
+                })
+                .open(move || panel.get().is_some() || model.get().recording.is_some())
+                .content({
+                    let actions = dictation.clone();
+                    move || {
+                        let paste = actions.clone();
+                        let discard = actions.clone();
+                        let copy = actions.clone();
+                        let retry = actions.clone();
+                        view()
+                            .flex_1()
+                            .p_4()
+                            .gap_3()
+                            .bg(rgb(0xf7f9f6))
+                            .text_color(rgb(0x202b28))
+                            .child(
+                                text(move || match panel.get() {
+                                    Some((_, dictation::Phase::Ready, _)) => "A 粘贴 · B 丢弃",
+                                    Some((_, dictation::Phase::Error(_), _)) => {
+                                        "转写失败 · 可在主窗口重试"
+                                    }
+                                    Some(_) => "正在转写…",
+                                    None => "正在录音…",
                                 })
-                                .child(text(format!("{}  ·  {}:{}", bridge.name, bridge.address, bridge.port)))
-                        }).collect::<Vec<_>>()
-                    }))
-                    .child(text(move || if model.get().bridges.is_empty() {
-                        "正在查找。请启动 Bridge，并允许局域网访问。"
-                    } else { "选择一个 Bridge，然后连接。" }))
-                    .child(text("首次配对文件路径"))
-                    .child(input()
-                        .value(move || path.get())
-                        .placeholder("/…/bridge/pairing.json")
-                        .on_change(move |value: &str| path.set(value.to_owned()))
-                        .h(px(38.0)).p_2())
-                    .child(text("使用 Bridge 启动时显示的 pairing.json 路径。配对后凭据保存在 Keychain。").text_size(px(13.0)))
-                    .child(view().flex_row().gap_3()
-                        .child(button().p_3().bg(move || theme().primary)
-                            .on_press(move || {
-                                if let Some(bridge) = model.get().bridges.into_iter().find(|bridge| bridge.id == selected.get()) {
-                                    let _ = Storage::set_item("bridge.autoconnect", "true");
-                                    let _ = connect.send(network::Command::Connect { bridge, invitation_path: path.get() });
-                                }
-                            })
-                            .child(text("连接").text_color(move || theme().primary_foreground)))
-                        .child(button().p_3().on_press(move || { let _ = Storage::set_item("bridge.autoconnect", "false"); auto_connect.set(false); let _ = disconnect.send(network::Command::Disconnect); }).child(text("断开"))))
-                    .child(text(move || format!("已确认的心跳  {}", model.get().heartbeats)).text_size(px(13.0)))
-            )
+                                .text_size(px(16.0)),
+                            )
+                            .child(
+                                scroll().h(px(92.0)).child(
+                                    text(move || match panel.get() {
+                                        Some((_, dictation::Phase::Error(error), _)) => error,
+                                        _ => draft_text.get(),
+                                    })
+                                    .text_size(px(18.0))
+                                    .text_color(rgb(0x202b28)),
+                                ),
+                            )
+                            .child(text(move || dictation_notice.get()).text_size(px(12.0)))
+                            .child(
+                                view()
+                                    .flex_row()
+                                    .gap_3()
+                                    .child(
+                                        button()
+                                            .p_2()
+                                            .on_press(move || {
+                                                if let Some((id, _, _)) = panel.get() {
+                                                    paste.confirm(&id);
+                                                }
+                                            })
+                                            .child(text("粘贴")),
+                                    )
+                                    .child(
+                                        button()
+                                            .p_2()
+                                            .on_press(move || {
+                                                if let Some((id, _, _)) = panel.get() {
+                                                    discard.discard(&id);
+                                                }
+                                            })
+                                            .child(text("丢弃")),
+                                    )
+                                    .child(
+                                        button()
+                                            .p_2()
+                                            .on_press(move || {
+                                                if let Some((id, _, _)) = panel.get() {
+                                                    copy.copy(&id);
+                                                }
+                                            })
+                                            .child(text("复制")),
+                                    )
+                                    .child(
+                                        button()
+                                            .p_2()
+                                            .on_press(move || {
+                                                if let Some((id, _, _)) = panel.get() {
+                                                    retry.retry(&id);
+                                                }
+                                            })
+                                            .child(text("重试转写")),
+                                    ),
+                            )
+                    }
+                }),
         )
-}
-
-fn render_draft(
-    dictation: dictation::Dictation,
-    id: String,
-    phase: dictation::Phase,
-    target: Option<String>,
-    draft_text: Signal<String>,
-) -> View {
-    let discard = dictation.clone();
-    let discard_id = id.clone();
-    let base = view().gap_2().p_3().bg(move || theme().secondary);
-    let body = match phase {
-        dictation::Phase::Working => base.child(text("正在本机转写…")),
-        dictation::Phase::Error(error) => base.child(text(format!("转写失败 · {error}"))).child(
-            button()
-                .p_2()
-                .on_press(move || dictation.retry(&id))
-                .child(text("重试转写")),
-        ),
-        dictation::Phase::Ready => {
-            let edit = dictation.clone();
-            let edit_id = id.clone();
-            let paste = dictation.clone();
-            let paste_id = id.clone();
-            base.child(text("转写草稿").text_size(px(18.0)))
-                .child(text(
-                    target
-                        .map(|name| format!("粘贴到 {name} · A 确认，B 丢弃"))
-                        .unwrap_or_else(|| "没有记录到目标应用，可复制草稿 · B 丢弃".into()),
-                ))
-                .child(
-                    input()
-                        .multiline(true)
-                        .value(move || draft_text.get())
-                        .h(px(118.0))
-                        .p_2()
-                        .bg(move || theme().background)
-                        .on_change(move |value: &str| {
-                            edit.edit(&edit_id, value);
-                            draft_text.set(value.to_owned());
-                        }),
-                )
+        .child(
+            view()
+                .flex_row()
+                .flex_1()
                 .child(
                     view()
-                        .flex_row()
-                        .gap_3()
+                        .w(px(206.0))
+                        .flex_none()
+                        .p_3()
+                        .pt_6()
+                        .gap_2()
+                        .bg(rgb(0xe0f0ed))
+                        .text_color(rgb(pages::INK))
                         .child(
-                            button()
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
                                 .p_2()
-                                .on_press(move || paste.confirm(&paste_id))
-                                .child(text("粘贴")),
+                                .pb_5()
+                                .child(image(wave_mark).w(px(24.0)).h(px(24.0)).flex_none())
+                                .child(
+                                    text("Stadia Wave")
+                                        .text_size(px(20.0))
+                                        .font_weight(FontWeight::SEMIBOLD),
+                                ),
                         )
+                        .children(
+                            ["概览", "按键映射", "设置", "诊断", "关于"]
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, label)| {
+                                    button()
+                                        .selected(move || page.get() == index)
+                                        .on_press(move || {
+                                            if page.get() == 1 && mapping_dirty.get() && index != 1
+                                            {
+                                                mapping_notice
+                                                    .set("请先保存或放弃修改，再切换页面。".into());
+                                            } else {
+                                                page.set(index);
+                                            }
+                                        })
+                                        .child(
+                                            view()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_3()
+                                                .px_3()
+                                                .h(px(40.0))
+                                                .rounded_md()
+                                                .bg(move || {
+                                                    rgb(if page.get() == index {
+                                                        0xc3e6df
+                                                    } else {
+                                                        0xe0f0ed
+                                                    })
+                                                })
+                                                .child(dynamic(move || {
+                                                    pages::nav_icon(index, page.get() == index)
+                                                }))
+                                                .child(text(label).text_size(px(15.0))),
+                                        )
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .child(view().flex_1())
                         .child(
-                            button()
-                                .p_2()
-                                .on_press(move || dictation.copy(&id))
-                                .child(text("复制")),
+                            view()
+                                .flex_row()
+                                .gap_2()
+                                .items_center()
+                                .justify_between()
+                                .pt_3()
+                                .child(
+                                    text(concat!("版本 ", env!("CARGO_PKG_VERSION")))
+                                        .text_size(px(12.0)),
+                                )
+                                .child(
+                                    button()
+                                        .on_press(move || {
+                                            update_notice.set("尚未配置更新发布来源。".into());
+                                            if page.get() == 1 && mapping_dirty.get() {
+                                                mapping_notice
+                                                    .set("请先保存或放弃修改，再切换页面。".into());
+                                            } else {
+                                                page.set(4);
+                                            }
+                                        })
+                                        .child(
+                                            pages::control()
+                                                .child(text("检查更新").text_size(px(11.0))),
+                                        ),
+                                ),
                         ),
                 )
-        }
-    };
-    body.child(
-        button()
-            .p_2()
-            .on_press(move || discard.discard(&discard_id))
-            .child(text("丢弃")),
-    )
+                .child(
+                    scroll().flex_1().child(
+                        view()
+                            .p_6()
+                            .gap_4()
+                            .child(when(
+                                move || page.get() == 0,
+                                move || pages::overview(model, endpoint),
+                            ))
+                            .child(when(
+                                move || page.get() == 1,
+                                move || mapping_page::page(model, mapping_dirty, mapping_notice),
+                            ))
+                            .child(when(
+                                move || page.get() == 2,
+                                move || {
+                                    view()
+                                        .gap_5()
+                                        .child(
+                                            text("设置")
+                                                .text_size(px(33.0))
+                                                .font_weight(FontWeight::SEMIBOLD),
+                                        )
+                                        .child(pages::bridge_settings(
+                                            model,
+                                            selected,
+                                            path,
+                                            auto_connect,
+                                            settings_commands.clone(),
+                                        ))
+                                        .child(pages::rule())
+                                        .child(pages::asr_settings(
+                                            endpoint,
+                                            language,
+                                            dictation.clone(),
+                                        ))
+                                },
+                            ))
+                            .child(when(
+                                move || page.get() == 3,
+                                move || {
+                                    pages::diagnostics(model, endpoint, language, rumble.clone())
+                                },
+                            ))
+                            .child(when(
+                                move || page.get() == 4,
+                                move || pages::about(about_mark.clone(), update_notice),
+                            )),
+                    ),
+                ),
+        )
 }

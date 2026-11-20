@@ -92,10 +92,13 @@ impl Handle {
                 enabled: HashSet::new(),
                 snapshot: HardwareState {
                     running: false,
+                    version: None,
                     message: "未配置 Stadiacast".into(),
                     controllers: vec![],
                 },
                 verified: false,
+                triggers: HashMap::new(),
+                axes: HashMap::new(),
             }
             .run(rx),
         );
@@ -212,6 +215,8 @@ struct Actor {
     enabled: HashSet<String>,
     snapshot: HardwareState,
     verified: bool,
+    triggers: HashMap<String, [u8; 2]>,
+    axes: HashMap<String, [i32; 4]>,
 }
 
 impl Actor {
@@ -403,6 +408,7 @@ impl Actor {
                 self.verified = false;
                 self.update(HardwareState {
                     running: false,
+                    version: None,
                     message: format!(
                         "Stadiacast 已退出 {code} {}",
                         error
@@ -451,6 +457,7 @@ impl Actor {
                 self.verified = false;
                 self.update(HardwareState {
                     running: false,
+                    version: None,
                     message: "正在等待 Stadiacast 接口".into(),
                     controllers: vec![],
                 });
@@ -483,6 +490,8 @@ impl Actor {
                             Some("game-started" | "game-connected")
                         ),
                     held,
+                    device_id: value["device_id"].as_str().map(str::to_owned),
+                    ip: value["ip"].as_str().map(str::to_owned),
                 };
                 if !ready {
                     self.enabled.remove(id);
@@ -504,6 +513,7 @@ impl Actor {
         controllers.sort_by(|a, b| a.id.cmp(&b.id));
         self.update(HardwareState {
             running: true,
+            version: status["version"].as_str().map(str::to_owned),
             message: "Stadiacast 运行中".into(),
             controllers,
         });
@@ -546,6 +556,25 @@ impl Actor {
                         })
                         .unwrap_or_default()
                 };
+                let triggers = event["triggers"]["l"]
+                    .as_u64()
+                    .zip(event["triggers"]["r"].as_u64())
+                    .map(|(left, right)| [left.min(255) as u8, right.min(255) as u8]);
+                let changed = triggers.is_some_and(|value| {
+                    self.triggers.insert(controller.clone(), value) != Some(value)
+                });
+                let axes = ["lx", "ly", "rx", "ry"].map(|key| {
+                    event["axes"][key]
+                        .as_i64()
+                        .and_then(|value| i32::try_from(value).ok())
+                });
+                let axes = match axes {
+                    [Some(lx), Some(ly), Some(rx), Some(ry)] => Some([lx, ly, rx, ry]),
+                    _ => None,
+                };
+                let axes_changed = axes.is_some_and(|value| {
+                    self.axes.insert(controller.clone(), value) != Some(value)
+                });
                 let pressed = names("pressed_names");
                 let released = names("released_names");
                 let mut held = self
@@ -570,7 +599,7 @@ impl Actor {
                     item.held = held.clone();
                 }
                 if let Some(owner) = &self.owner
-                    && (!pressed.is_empty() || !released.is_empty())
+                    && (changed || axes_changed || !pressed.is_empty() || !released.is_empty())
                 {
                     self.emit(ServerMessage::Input {
                         session_id: owner.session.clone(),
@@ -578,6 +607,8 @@ impl Actor {
                         pressed,
                         released,
                         held,
+                        triggers,
+                        axes,
                     });
                 }
             }
@@ -741,7 +772,69 @@ mod tests {
             enabled: HashSet::new(),
             snapshot: HardwareState::default(),
             verified: false,
+            triggers: HashMap::new(),
+            axes: HashMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn stick_motion_and_return_to_center_are_delivered() {
+        let mut actor = actor();
+        let (events, mut receive) = mpsc::channel(16);
+        actor.owner = Some(Owner {
+            session: "test".into(),
+            events,
+        });
+        let input = json!({"event":"input", "type":"rpc_input", "controller":"c0", "axes":{"lx":-12000,"ly":25000,"rx":32000,"ry":-30000}});
+        actor.event(input.clone());
+        assert!(matches!(
+            receive.try_recv(),
+            Ok(Event::Message(ServerMessage::Input {
+                axes: Some([-12000, 25000, 32000, -30000]),
+                ..
+            }))
+        ));
+        actor.event(input);
+        assert!(receive.try_recv().is_err());
+        actor.event(json!({"event":"input", "type":"rpc_input", "controller":"c0", "axes":{"lx":0,"ly":0,"rx":0,"ry":0}}));
+        assert!(matches!(
+            receive.try_recv(),
+            Ok(Event::Message(ServerMessage::Input {
+                axes: Some([0, 0, 0, 0]),
+                ..
+            }))
+        ));
+        let _ = fs::remove_dir_all(actor.run_dir);
+    }
+
+    #[tokio::test]
+    async fn analog_trigger_changes_are_delivered_without_digital_buttons() {
+        let mut actor = actor();
+        let (events, mut receive) = mpsc::channel(16);
+        actor.owner = Some(Owner {
+            session: "test".into(),
+            events,
+        });
+        let input = json!({"event":"input", "type":"rpc_input", "controller":"c0", "triggers":{"l":128,"r":255}});
+        actor.event(input.clone());
+        assert!(matches!(
+            receive.try_recv(),
+            Ok(Event::Message(ServerMessage::Input {
+                triggers: Some([128, 255]),
+                ..
+            }))
+        ));
+        actor.event(input);
+        assert!(receive.try_recv().is_err());
+        actor.event(json!({"event":"input", "type":"rpc_input", "controller":"c0", "triggers":{"l":0,"r":0}}));
+        assert!(matches!(
+            receive.try_recv(),
+            Ok(Event::Message(ServerMessage::Input {
+                triggers: Some([0, 0]),
+                ..
+            }))
+        ));
+        let _ = fs::remove_dir_all(actor.run_dir);
     }
 
     #[tokio::test]

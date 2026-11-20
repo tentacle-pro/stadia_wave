@@ -120,10 +120,14 @@ impl Dictation {
                     }
                     match result {
                         Ok(text) => {
+                            crate::statistics::update(|stats| stats.success += 1);
                             draft.text = text;
                             draft.phase = Phase::Ready;
                         }
-                        Err(error) => draft.phase = Phase::Error(format!("{error:#}")),
+                        Err(error) => {
+                            crate::statistics::update(|stats| stats.failure += 1);
+                            draft.phase = Phase::Error(format!("{error:#}"));
+                        }
                     }
                 }
             });
@@ -208,16 +212,6 @@ impl Dictation {
         }
     }
 
-    pub fn edit(&self, id: &str, text: &str) {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.state.paste_deadline.is_none()
-            && let Some(draft) = inner.state.draft.as_mut().filter(|draft| draft.id() == id)
-            && draft.phase == Phase::Ready
-        {
-            draft.text = text.to_owned();
-        }
-    }
-
     pub fn copy(&self, id: &str) {
         let mut inner = self.inner.lock().unwrap();
         let Some(draft) = inner.state.draft.as_ref().filter(|draft| draft.id() == id) else {
@@ -255,6 +249,13 @@ impl Dictation {
             inner.state.clear_draft("已丢弃草稿");
             let _ = self.jobs.send(None);
         }
+    }
+
+    pub fn mapping_blocked(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.state.draft.is_some()
+            || inner.state.action.is_some()
+            || inner.state.paste_deadline.is_some()
     }
 
     pub fn controller_input(&self, bridge: &str, controller: &str, pressed: &[String]) {

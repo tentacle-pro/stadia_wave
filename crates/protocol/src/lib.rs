@@ -74,6 +74,10 @@ pub enum ServerMessage {
         pressed: Vec<String>,
         released: Vec<String>,
         held: Vec<String>,
+        #[serde(default)]
+        triggers: Option<[u8; 2]>,
+        #[serde(default)]
+        axes: Option<[i32; 4]>,
     },
     RecordingStarted {
         session_id: String,
@@ -116,6 +120,8 @@ pub const MAX_RECORDING_SECONDS: f64 = 60.0;
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HardwareState {
     pub running: bool,
+    #[serde(default)]
+    pub version: Option<String>,
     pub message: String,
     pub controllers: Vec<ControllerState>,
 }
@@ -127,4 +133,8 @@ pub struct ControllerState {
     pub battery_percent: Option<u8>,
     pub rumble_ready: bool,
     pub held: Vec<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub ip: Option<String>,
 }

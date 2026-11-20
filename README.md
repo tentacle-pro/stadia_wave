@@ -106,6 +106,32 @@ Stadiacast 退出后，Bridge 取消未完成录音并延迟重启子进程。�
 
 通过 `./scripts/run-bridge.sh` 启动 Bridge，可将输出保存到 Bridge 数据目录的 logs。Companion 每次启动的诊断日志保存在其数据目录的 logs。Stadiacast 的结构化事件及 stdout/stderr 位于 Bridge 的 captures 中。日志和录音目前由用户手动清理。
 
-开发脚本默认使用当前机器的 Apple Development 身份签名，可用 `WAVE_SIGN_IDENTITY` 覆盖。二进制和签名身份均未变化时直接打开已有应用。换用开发者身份后可能需要刷新一次系统授权。运行 `./scripts/package-macos.sh` 生成 release 版 Companion.app 和 Bridge，输出到 target/macos。此包用于本机开发使用，尚未进行公证。
+开发脚本默认使用当前机器的 Apple Development 身份签名，可用 `WAVE_SIGN_IDENTITY` 覆盖。二进制和签名身份均未变化时直接打开已有应用。换用开发者身份后可能需要刷新一次系统授权。
 
 睡眠唤醒和真实网络切换会影响手柄到 Bridge 的连接。Bridge 固定 IP 或路由器 DHCP DNS 发生变化时，仍需同步用户的网络配置。
+
+## 打包 macOS 应用
+
+`./scripts/package-macos.sh` 输出 `Wave Companion.app`、供独立部署的 `wave-bridge` 和 App ZIP 到 `target/macos`。可以用 `WAVE_PACKAGE_OUTPUT` 指定其他目录。构建需要 Python 3 和 Rust 工具链的 `rust-docs` 组件。App 内含已签名的 Wave Bridge，许可证与声明保存在 `Contents/Resources/Licenses`，可从「关于」页打开。
+
+本地测试可在环境变量 `WAVE_SIGN_IDENTITY`（或 `APPLE_SIGNING_IDENTITY`）指定钥匙串中的 Apple Development 身份。两者均未设置时使用临时签名。对外发布可使用以下环境变量启用 Apple 公证并将票据附加到 App：
+
+```sh
+WAVE_SIGN_IDENTITY="Developer ID Application: YOUR NAME (TEAMID)" \
+  WAVE_NOTARIZE=1 APPLE_NOTARY_PROFILE="stadia-wave" \
+  ./scripts/package-macos.sh
+```
+
+用 `xcrun notarytool store-credentials stadia-wave` 将公证凭证存入钥匙串。CI 也可用密钥管理器注入 `APPLE_ID`、`APPLE_PASSWORD`（App 专用密码）和 `APPLE_TEAM_ID`，或注入 `APPLE_API_KEY`（Key ID）、`APPLE_API_KEY_PATH`（.p8 文件路径）和 `APPLE_API_ISSUER`。公证提交的是 App ZIP。
+
+需要在 App 中携带 Stadiacast 时，设置 `WAVE_STADIACAST_BINARY` 为已签名的 macOS 二进制路径，并设置 `WAVE_STADIACAST_LICENSE_DIR` 为包含该版本 `LICENSE` 和 `NOTICE` 的目录。公证模式还要求将二进制内捆绑的 Python 和其他依赖的许可及版权声明放在该目录的 `THIRD-PARTY-LICENSES` 子目录。Bridge 会沿用已保存的手柄 IP、通告 IP 和 DNS 配置。首次部署仍需按前面的说明完成网络配置。
+
+Stadiacast 上游的 MIT 许可对三份源自 Google 固件的 protobuf 定义有例外。公开分发前，请一并核对上游 NOTICE 和所选二进制全部组件的分发条款。公证模式保留 Stadiacast 原有签名，要求它在构建时以 Developer ID 签署 PyInstaller 包内的原生组件。
+
+## 手柄桌面映射
+
+在「按键映射」点击手柄热点或右侧输入行，选择动作。点击「录制快捷键」后，在 Mac 键盘上按下组合键，再保存。摇杆推动与 L3 / R3 按下分别配置。修改期间暂停桌面输出，离开页面前需要保存或放弃修改。
+
+映射首次使用默认关闭。通过 Switch 开启后立即保存并生效，松开按键并让摇杆回中。默认左摇杆移动指针，L2 同时加速指针和滚动，R2 同时降低两者速度，X 按住鼠标左键以拖拽，Y 作为鼠标右键，右摇杆滚动。L1 按住打开应用切换器，十字键左右选择、向下取消，松开 L1 确认。普通十字键左右发送 Control + 方向键切换桌面空间，效果取决于当前屏幕的桌面数量及系统快捷键设置。
+
+普通状态下 A / B 对应 Enter / Escape。录音和待处理语音草稿优先，A / B 用于确认和丢弃，同一次按压在松开前由语音流程消费。快捷键录制和指针测试期间暂停实际桌面映射。断连、手柄离线和退出时释放手柄持有的键，恢复后等待输入回中。参数和映射保存在 Companion 数据目录的 button-mapping.json。交互和验收细节见[按键映射设计](docs/button-mapping.md)。

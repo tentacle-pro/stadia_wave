@@ -36,6 +36,10 @@ pub struct ViewState {
     pub connected: bool,
     pub active_bridge: Option<String>,
     pub heartbeats: u64,
+    pub latency: Vec<Option<f64>>,
+    pub axes: [i32; 4],
+    pub triggers: [u8; 2],
+    pub held: Vec<String>,
     pub session_id: Option<String>,
     pub retrying: bool,
     pub hardware: HardwareState,
@@ -53,6 +57,10 @@ impl Default for ViewState {
             connected: false,
             active_bridge: None,
             heartbeats: 0,
+            latency: vec![],
+            axes: [0; 4],
+            triggers: [0; 2],
+            held: vec![],
             session_id: None,
             retrying: false,
             hardware: HardwareState::default(),
@@ -443,6 +451,7 @@ async fn session(
         socket.send(Message::Text(serde_json::to_string(&auth)?.into())).await?;
         let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut ping_at = std::collections::HashMap::new();
         let mut last_received = tokio::time::Instant::now();
         let mut current_session: Option<String> = None;
         let mut incoming_audio: Option<IncomingAudio> = None;
@@ -459,8 +468,16 @@ async fn session(
                 _ = heartbeat.tick() => {
                     if last_received.elapsed() > Duration::from_secs(20) { bail!("Bridge 响应超时"); }
                     if let Some(session_id) = &current_session {
+                        if !ping_at.is_empty() {
+                            let mut view = state.lock().unwrap();
+                            view.latency.push(None);
+                            if view.latency.len() > 60 { view.latency.remove(0); }
+                        }
+                        ping_at.clear();
+                        let request_id = Uuid::new_v4().to_string();
+                        ping_at.insert(request_id.clone(), tokio::time::Instant::now());
                         tokio::time::timeout(Duration::from_secs(5), socket.send(Message::Text(
-                            serde_json::to_string(&ClientMessage::Ping { session_id: session_id.clone(), request_id: Uuid::new_v4().to_string() })?.into()
+                            serde_json::to_string(&ClientMessage::Ping { session_id: session_id.clone(), request_id })?.into()
                         ))).await??;
                     }
                 }
@@ -495,13 +512,25 @@ async fn session(
                             ServerMessage::Hardware { session_id, snapshot } if current_session.as_ref() == Some(&session_id) => {
                                 state.lock().unwrap().hardware = snapshot;
                             }
-                            ServerMessage::Input { session_id, controller, pressed, released, .. } if current_session.as_ref() == Some(&session_id) => {
+                            ServerMessage::Input { session_id, controller, pressed, released, triggers, axes, held } if current_session.as_ref() == Some(&session_id) => {
+                                crate::mapping::input(&session_id, &controller, &held, axes, triggers,
+                                    dictation.as_ref().is_some_and(|d| d.mapping_blocked())
+                                        || state.lock().unwrap().recording.is_some());
                                 if let Some(dictation) = dictation {
                                     dictation.controller_input(&bridge.id, &controller, &pressed);
                                 }
-                                state.lock().unwrap().input = format!("{controller}  按下 {}  松开 {}", pressed.join(", "), released.join(", "));
+                                {
+                                    let mut view = state.lock().unwrap();
+                                    if let Some(axes) = axes { view.axes = axes; }
+                                    if let Some(triggers) = triggers { view.triggers = triggers; }
+                                    view.held = held;
+                                }
+                                let analog = triggers.map(|[left, right]| format!("  L2 {left}/255  R2 {right}/255")).unwrap_or_default();
+                                let sticks = axes.map(|[lx, ly, rx, ry]| format!("  左摇杆 X {lx} Y {ly}  右摇杆 X {rx} Y {ry}")).unwrap_or_default();
+                                state.lock().unwrap().input = format!("{controller}  按下 {}  松开 {}{analog}{sticks}", pressed.join(", "), released.join(", "));
                             }
                             ServerMessage::RecordingStarted { session_id, recording_id, .. } if current_session.as_ref() == Some(&session_id) => {
+                                crate::mapping::release();
                                 if let Some(dictation) = dictation {
                                     dictation.recording_started(recording_id.clone());
                                 }
@@ -528,8 +557,13 @@ async fn session(
                             }
                             ServerMessage::Hardware { .. } | ServerMessage::Input { .. } | ServerMessage::RecordingStarted { .. }
                                 | ServerMessage::RecordingCancelled { .. } | ServerMessage::Audio { .. } | ServerMessage::CommandResult { .. } => {}
-                            ServerMessage::Pong { session_id, .. } if current_session.as_ref() == Some(&session_id) => {
-                                state.lock().unwrap().heartbeats += 1;
+                            ServerMessage::Pong { session_id, request_id } if current_session.as_ref() == Some(&session_id) => {
+                                let mut view = state.lock().unwrap();
+                                view.heartbeats += 1;
+                                if let Some(sent) = ping_at.remove(&request_id) {
+                                    view.latency.push(Some(sent.elapsed().as_secs_f64() * 1000.0));
+                                    if view.latency.len() > 60 { view.latency.remove(0); }
+                                }
                                 log::debug!("PONG");
                             }
                             ServerMessage::Pong { .. } => {}
@@ -544,7 +578,9 @@ async fn session(
                             if audio.data.len() == audio.bytes {
                                 let audio = incoming_audio.take().unwrap();
                                 let directory = ProjectDirs::from("dev", "stadiawave", "companion").context("Missing user data directory")?.data_dir().join("recordings");
+                                let is_new = !directory.join(format!("{}.ogg", audio.id)).exists();
                                 let recording = audio.save(&directory)?;
+                                if is_new { crate::statistics::update(|stats| { stats.received += 1; stats.seconds += recording.seconds; }); }
                                 socket.send(Message::Text(serde_json::to_string(&ClientMessage::AudioReceived {
                                     session_id: audio.session_id.clone(), recording_id: recording.id.clone(),
                                 })?.into())).await?;

@@ -166,6 +166,31 @@ async fn decode_wav(recording: &Path) -> Result<Vec<u8>> {
     Ok(wav)
 }
 
+pub async fn check(endpoint: &str) -> Result<String> {
+    let endpoint = local_endpoint(endpoint)?;
+    let models = Client::builder()
+        .no_proxy()
+        .redirect(Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()?
+        .get(endpoint.join("v1/models")?)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Models>()
+        .await?;
+    ensure!(!models.data.is_empty(), "服务未提供可用模型");
+    Ok(format!(
+        "服务可用 · {}",
+        models
+            .data
+            .into_iter()
+            .map(|model| model.id)
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::local_endpoint;

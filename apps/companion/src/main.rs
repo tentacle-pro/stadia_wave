@@ -33,10 +33,29 @@ fn main() -> impl std::process::Termination {
                 .unwrap_or_else(|_| "Wave Companion".to_owned()),
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             app_id: "dev.stadiawave.companion".to_owned(),
-            size: (720, 700),
+            #[cfg(target_os = "macos")]
+            icon: app_icon(),
+            size: (1180, 820),
             ..Default::default()
         },
     )
+}
+
+#[cfg(target_os = "macos")]
+fn app_icon() -> Option<std::path::PathBuf> {
+    let bundled = std::env::current_exe().ok().and_then(|executable| {
+        executable
+            .parent()?
+            .parent()
+            .map(|contents| contents.join("Resources/StadiaWave.icns"))
+    });
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/StadiaWave.icns");
+    // Set AppKit's running icon explicitly so the Dock can display it even
+    // when Launch Services has cached the icon of an earlier development build.
+    bundled
+        .into_iter()
+        .chain([source])
+        .find(|path| path.is_file())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
