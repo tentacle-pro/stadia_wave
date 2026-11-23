@@ -706,8 +706,123 @@ pub fn page(
             .text_size(px(12.0))
             .text_color(rgb(pages::MUTED)),
         )
+        .child(behavior_panel())
         .child(
             text(move || notice.get())
+                .text_size(px(12.0))
+                .text_color(rgb(pages::MUTED)),
+        )
+}
+
+fn behavior_panel() -> impl IntoElement {
+    let snapshots = signal(mapping::behavior_status());
+    let feedback = signal(String::new());
+    set_interval(std::time::Duration::from_millis(500), move || {
+        snapshots.set(mapping::behavior_status());
+    });
+    view()
+        .gap_3()
+        .child(pages::rule())
+        .child(
+            text("行为运行时 · 框架验证")
+                .text_size(px(20.0))
+                .font_weight(FontWeight::SEMIBOLD),
+        )
+        .child(
+            text("启用时，规则和脚本优先处理输入；关闭后恢复上方的基础映射。要让按键完全无动作，请将基础映射设为「无动作」。")
+                .text_size(px(12.0))
+                .text_color(rgb(pages::MUTED)),
+        )
+        .child(
+            view()
+                .flex_row()
+                .gap_2()
+                .child(small_button("安装手写示例", move || {
+                    feedback.set(
+                        match crate::behaviors::install_examples()
+                            .and_then(|_| mapping::reload_behaviors())
+                        {
+                            Ok(()) => "示例已就绪，已有文件会保留。".into(),
+                            Err(error) => error.to_string(),
+                        },
+                    );
+                }))
+                .child(small_button("重新加载", move || {
+                    feedback.set(match mapping::reload_behaviors() {
+                        Ok(()) => "已重新加载，修改的输入回中后生效。".into(),
+                        Err(error) => error.to_string(),
+                    });
+                }))
+                .child(small_button("打开行为目录", move || {
+                    let _ = std::fs::create_dir_all(crate::behaviors::directory());
+                    let _ = std::process::Command::new("/usr/bin/open")
+                        .arg(crate::behaviors::directory())
+                        .spawn();
+                })),
+        )
+        .child(dynamic(move || {
+            view()
+                .gap_2()
+                .children(snapshots.get().0.into_iter().map(|snapshot| {
+                    let id = snapshot.id.clone();
+                    let active = snapshot.status == wave_behavior::Status::Active;
+                    let status = match &snapshot.status {
+                        wave_behavior::Status::Disabled => "已关闭 · 使用基础映射".into(),
+                        wave_behavior::Status::Active => "运行中".into(),
+                        wave_behavior::Status::Faulted(error) => format!("故障停用 · 使用基础映射 · {error}"),
+                    };
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .p_2()
+                        .rounded_md()
+                        .bg(rgb(0xe0f0ed))
+                        .child(
+                            view()
+                                .flex_1()
+                                .gap_1()
+                                .child(text(snapshot.name).font_weight(FontWeight::SEMIBOLD))
+                                .child(
+                                    text(status)
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(pages::MUTED)),
+                                ),
+                        )
+                        .child(
+                            switch()
+                                .checked(active)
+                                .on_change(move |enabled: &bool| {
+                                    feedback.set(match mapping::enable_behavior(&id, *enabled) {
+                                        Ok(()) => String::new(),
+                                        Err(error) => error.to_string(),
+                                    });
+                                    snapshots.set(mapping::behavior_status());
+                                })
+                                .track_style(|s| {
+                                    s.w(px(44.0))
+                                        .p(px(2.0))
+                                        .rounded_full()
+                                        .bg(rgb(0x889b94))
+                                        .checked(|s| s.bg(rgb(pages::MINT)))
+                                })
+                                .thumb_style(|s| {
+                                    s.size(px(20.0))
+                                        .rounded_full()
+                                        .bg(rgb(0xffffff))
+                                        .checked(|s| s.translate_x(px(20.0)))
+                                })
+                                .child(text("覆盖基础映射").text_size(px(12.0))),
+                        )
+                }))
+        }))
+        .child(
+            text(move || snapshots.get().1)
+                .text_size(px(12.0))
+                .text_color(rgb(pages::MUTED)),
+        )
+        .child(
+            text(move || feedback.get())
                 .text_size(px(12.0))
                 .text_color(rgb(pages::MUTED)),
         )

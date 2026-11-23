@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/bridge", "apps/companion", "crates/protocol"]
+members = ["apps/bridge", "apps/companion", "crates/protocol", "crates/behavior"]
 resolver = "2"
 
 [workspace.package]

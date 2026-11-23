@@ -18,6 +18,7 @@ uuid.workspace = true
 futures-util.workspace = true
 directories.workspace = true
 wave-protocol.workspace = true
+wave-behavior = { path = "../../crates/behavior" }
 sha2.workspace = true
 hex.workspace = true
 rustls-pemfile = "2"

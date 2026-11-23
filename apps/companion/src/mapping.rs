@@ -10,6 +10,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use wave_behavior::{EventKind, Frame, LEGACY, Output, Runtime};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Shortcut {
@@ -398,6 +399,12 @@ struct Engine {
     last_tick: Instant,
     scroll: [f64; 2],
     repeat: Option<(String, Instant)>,
+    behaviors: Runtime,
+    behavior_paths: BTreeMap<String, PathBuf>,
+    behavior_notice: String,
+    frame: Frame,
+    blocked: BTreeSet<String>,
+    epoch: Instant,
 }
 static STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -434,12 +441,15 @@ pub fn input(
         engine.owner = Some(owner);
     }
     if let Some(axes) = axes {
-        engine.axes = axes;
+        engine.frame.axes = axes;
     }
     if let Some(triggers) = triggers {
-        engine.triggers = triggers;
+        engine.frame.triggers = triggers;
     }
+    engine.axes = engine.frame.axes;
+    engine.triggers = engine.frame.triggers;
     engine.input(held, voice, desktop::authorized());
+    engine.flush();
 }
 
 impl Engine {
@@ -459,6 +469,12 @@ impl Engine {
             last_tick: Instant::now(),
             scroll: [0.0; 2],
             repeat: None,
+            behaviors: Runtime::new(key_code),
+            behavior_paths: BTreeMap::new(),
+            behavior_notice: String::new(),
+            frame: Frame::default(),
+            blocked: BTreeSet::new(),
+            epoch: Instant::now(),
         }
     }
 
@@ -466,15 +482,13 @@ impl Engine {
         if self.switcher.is_some() {
             self.tap(53);
         }
-        for key in std::mem::take(&mut self.outputs) {
-            output::mapping_key(key, false, &BTreeSet::new());
-        }
-        for (button, held) in self.mouse.into_iter().enumerate() {
-            if held {
-                output::mapping_mouse_button(button, false);
-            }
-        }
+        self.behaviors.reset();
+        self.outputs.clear();
         self.mouse = [false; 2];
+        self.frame = Frame::default();
+        self.blocked.clear();
+        self.epoch = Instant::now();
+        self.flush();
         self.held.clear();
         self.switcher = None;
         self.cancelled = false;
@@ -485,20 +499,73 @@ impl Engine {
         self.repeat = None;
         self.last_tick = Instant::now();
     }
-    fn tap(&self, code: u16) {
-        output::mapping_key(code, true, &self.outputs);
-        if !self.outputs.contains(&code) {
-            output::mapping_key(code, false, &self.outputs);
+    fn flush(&mut self) {
+        for event in self.behaviors.drain() {
+            match event {
+                Output::Key { code, down, held } => output::mapping_key(code, down, &held),
+                Output::Mouse { button, down } => output::mapping_mouse_button(button, down),
+                Output::Move { x, y, buttons } => output::mapping_move(x, y, buttons),
+                Output::Scroll { x, y } => output::mapping_scroll(x, y),
+            }
         }
     }
+    fn tap(&mut self, code: u16) {
+        self.behaviors.broker().tap(LEGACY, code, BTreeSet::new());
+        self.flush();
+    }
     fn sync_keys(&mut self, wanted: BTreeSet<u16>) {
-        for key in self.outputs.difference(&wanted) {
-            output::mapping_key(*key, false, &wanted);
-        }
-        for key in wanted.difference(&self.outputs) {
-            output::mapping_key(*key, true, &wanted);
-        }
+        self.behaviors.broker().set_keys(LEGACY, wanted.clone());
         self.outputs = wanted;
+        self.flush();
+    }
+    fn route(&mut self) {
+        let consumed = self.behaviors.dispatch(&self.frame);
+        self.blocked
+            .retain(|input| wave_behavior::input_active(&self.frame, input));
+        self.blocked.extend(consumed);
+        if self.blocked.contains("left_stick") {
+            self.axes[0] = 0;
+            self.axes[1] = 0;
+        }
+        if self.blocked.contains("right_stick") {
+            self.axes[2] = 0;
+            self.axes[3] = 0;
+        }
+        if self.blocked.contains("l2") {
+            self.triggers[0] = 0;
+        }
+        if self.blocked.contains("r2") {
+            self.triggers[1] = 0;
+        }
+        if self
+            .switcher
+            .as_ref()
+            .is_some_and(|input| self.blocked.contains(input))
+        {
+            self.tap(53);
+            self.switcher = None;
+            self.cancelled = false;
+            self.repeat = None;
+        }
+    }
+    fn sync_held(&mut self, held: &BTreeSet<String>) {
+        let mut keys = BTreeSet::new();
+        let mut mouse = [false; 2];
+        for input in held {
+            match self.config.bindings.get(input) {
+                Some(Action::Hold(shortcut)) => keys.extend(shortcut.keys()),
+                Some(Action::MouseHold) => mouse[0] = true,
+                Some(Action::RightMouseHold) => mouse[1] = true,
+                _ => {}
+            }
+        }
+        if self.switcher.is_some() && !self.cancelled {
+            keys.insert(55);
+        }
+        self.sync_keys(keys);
+        self.behaviors.broker().set_mouse(LEGACY, mouse);
+        self.mouse = mouse;
+        self.flush();
     }
     fn input(&mut self, held: &[String], voice: bool, authorized: bool) {
         let mut next: BTreeSet<String> = held.iter().map(|s| s.to_ascii_lowercase()).collect();
@@ -516,9 +583,18 @@ impl Engine {
             self.armed = next.is_empty()
                 && self.axes.iter().all(|v| v.abs() < 5000)
                 && self.triggers.iter().all(|v| *v < 20);
+            self.frame.held = next.clone();
             self.held = next;
             return;
         }
+        self.frame.kind = EventKind::Input;
+        self.frame.pressed = next.difference(&self.frame.held).cloned().collect();
+        self.frame.released = self.frame.held.difference(&next).cloned().collect();
+        self.frame.held = next.clone();
+        self.frame.time_ms = self.epoch.elapsed().as_millis() as u64;
+        self.frame.dt_ms = 0;
+        self.route();
+        next.retain(|input| !self.blocked.contains(input));
         let pressed: Vec<_> = next.difference(&self.held).cloned().collect();
         if self
             .switcher
@@ -537,26 +613,7 @@ impl Engine {
             self.switcher = Some(key);
             self.cancelled = false;
         }
-        let mut wanted = BTreeSet::new();
-        let mut mouse = [false; 2];
-        for key in &next {
-            match actions.get(key) {
-                Some(Action::Hold(shortcut)) => wanted.extend(shortcut.keys()),
-                Some(Action::MouseHold) => mouse[0] = true,
-                Some(Action::RightMouseHold) => mouse[1] = true,
-                _ => {}
-            }
-        }
-        if self.switcher.is_some() && !self.cancelled {
-            wanted.insert(55);
-        }
-        self.sync_keys(wanted);
-        for button in 0..2 {
-            if mouse[button] != self.mouse[button] {
-                output::mapping_mouse_button(button, mouse[button]);
-            }
-        }
-        self.mouse = mouse;
+        self.sync_held(&next);
         if pressed
             .iter()
             .any(|key| actions.get(key) == Some(&Action::AppSwitcher))
@@ -615,6 +672,7 @@ impl Engine {
             self.repeat = None;
         }
         self.held = next;
+        self.flush();
     }
     fn tick(&mut self, now: Instant) {
         let dt = now.duration_since(self.last_tick).as_secs_f64();
@@ -626,6 +684,17 @@ impl Engine {
         if !self.armed || self.paused || !self.config.enabled {
             return;
         }
+        self.frame.kind = EventKind::Tick;
+        self.frame.pressed.clear();
+        self.frame.released.clear();
+        self.frame.time_ms = now.duration_since(self.epoch).as_millis() as u64;
+        self.frame.dt_ms = (dt * 1000.0) as u64;
+        self.axes = self.frame.axes;
+        self.triggers = self.frame.triggers;
+        self.route();
+        self.held.retain(|input| !self.blocked.contains(input));
+        let held = self.held.clone();
+        self.sync_held(&held);
         if let Some((key, deadline)) = self.repeat.clone() {
             if now >= deadline {
                 self.tap(if key == "dpad_left" { 123 } else { 124 });
@@ -639,7 +708,7 @@ impl Engine {
                 Some(Action::Pointer) => output::mapping_move(
                     x * self.config.speed * dt * multiplier,
                     y * self.config.speed * dt * multiplier,
-                    self.mouse,
+                    self.behaviors.broker().buttons(),
                 ),
                 Some(Action::Scroll) => {
                     let sign = if self.config.reverse_scroll {
@@ -660,6 +729,84 @@ impl Engine {
         }
     }
 }
+pub fn behavior_status() -> (Vec<wave_behavior::Snapshot>, String) {
+    let engine = engine().lock().unwrap();
+    (engine.behaviors.snapshots(), engine.behavior_notice.clone())
+}
+pub fn reload_behaviors() -> Result<()> {
+    let plan = crate::behaviors::scan()?;
+    let mut engine = engine().lock().unwrap();
+    let removed: Vec<_> = engine
+        .behavior_paths
+        .iter()
+        .filter(|(id, path)| {
+            !plan.prepared.contains_key(*id)
+                && (!plan.files.contains(*path)
+                    || plan
+                        .paths
+                        .iter()
+                        .any(|(new_id, new_path)| new_path == *path && new_id != *id))
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in removed {
+        engine.behaviors.unload(&id);
+        engine.behavior_paths.remove(&id);
+    }
+    for (id, prepared) in plan.prepared {
+        engine
+            .behavior_paths
+            .insert(id.clone(), plan.paths[&id].clone());
+        if engine.behaviors.definition(&id) == Some(prepared.definition()) {
+            continue;
+        }
+        engine
+            .blocked
+            .extend(prepared.definition().inputs.iter().cloned());
+        engine.behaviors.install(prepared);
+    }
+    engine.behavior_notice = plan.errors.join("\n");
+    engine.flush();
+    Ok(())
+}
+pub fn enable_behavior(id: &str, enabled: bool) -> Result<()> {
+    let mut engine = engine().lock().unwrap();
+    let previous = engine
+        .behaviors
+        .definition(id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("找不到行为"))?;
+    engine.blocked.extend(previous.inputs.iter().cloned());
+    // Stop first, including when the file can no longer be persisted.
+    if !enabled {
+        engine.behaviors.enable(id, false)?;
+        engine.flush();
+    }
+    let path = engine.behavior_paths[id].clone();
+    let result = (|| -> Result<()> {
+        let current: wave_behavior::Definition = serde_json::from_slice(&std::fs::read(&path)?)?;
+        ensure!(current == previous, "行为文件已修改，请先重新加载");
+        let mut next = previous;
+        next.enabled = enabled;
+        crate::behaviors::write(&path, &next)
+    })();
+    if let Err(error) = result {
+        return Err(anyhow::anyhow!(
+            "{}：{error}",
+            if enabled {
+                "无法启用行为"
+            } else {
+                "行为已停用，但无法保存"
+            }
+        ));
+    }
+    if enabled {
+        engine.behaviors.enable(id, true)?;
+    }
+    engine.flush();
+    Ok(())
+}
+
 pub fn speed_multiplier(config: &Config, triggers: [u8; 2]) -> f64 {
     let mut multiplier: f64 = 1.0;
     for (index, name) in ["l2", "r2"].iter().enumerate() {
@@ -692,6 +839,9 @@ pub fn start(state: Arc<Mutex<ViewState>>, dictation: crate::dictation::Dictatio
     if STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
+    if let Err(error) = reload_behaviors() {
+        log::warn!("Behavior loading failed: {error}");
+    }
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(Duration::from_millis(10));
@@ -710,6 +860,7 @@ pub fn start(state: Arc<Mutex<ViewState>>, dictation: crate::dictation::Dictatio
                 engine.reset();
             } else {
                 engine.tick(Instant::now());
+                engine.flush();
             }
         }
     });
@@ -869,8 +1020,8 @@ mod tests {
     fn triggers_scale_right_stick_scrolling_with_precision_priority() {
         fn scroll_for(triggers: [u8; 2]) -> i32 {
             let mut engine = active();
-            engine.axes[2] = 32767;
-            engine.triggers = triggers;
+            engine.frame.axes[2] = 32767;
+            engine.frame.triggers = triggers;
             let now = Instant::now();
             engine.last_tick = now - Duration::from_millis(100);
             engine.tick(now);
@@ -882,6 +1033,97 @@ mod tests {
         assert!(normal > 0 && fast > normal * 2);
         assert!(slow > 0 && slow < normal / 2);
         assert_eq!(scroll_for([255, 255]), slow);
+    }
+    #[test]
+    fn rule_mouse_scope_blocks_duplicate_default_clicks_and_hot_disable_reentry() {
+        let mut engine = active();
+        let mut definition: wave_behavior::Definition =
+            serde_json::from_str(include_str!("../behaviors/mouse-buttons.json")).unwrap();
+        definition.enabled = true;
+        engine
+            .behaviors
+            .install(wave_behavior::Prepared::new(definition, key_code).unwrap());
+        engine.behaviors.dispatch(&Frame::default());
+        send(&mut engine, &["x"]);
+        output::MOUSE.with_borrow(|events| assert_eq!(*events, vec![(0, true)]));
+        assert!(!engine.mouse[0]);
+        engine.behaviors.enable("mouse-buttons", false).unwrap();
+        engine.flush();
+        send(&mut engine, &["x"]);
+        output::MOUSE.with_borrow(|events| assert_eq!(*events, vec![(0, true), (0, false)]));
+        send(&mut engine, &[]);
+        send(&mut engine, &["x"]);
+        output::MOUSE
+            .with_borrow(|events| assert_eq!(*events, vec![(0, true), (0, false), (0, true)]));
+    }
+    #[test]
+    fn disabled_examples_do_not_execute_when_base_mapping_is_empty() {
+        for (source, input) in [
+            (include_str!("../behaviors/mouse-buttons.json"), "x"),
+            (include_str!("../behaviors/app-switcher.json"), "l1"),
+        ] {
+            let mut engine = active();
+            for binding in engine.config.bindings.values_mut() {
+                *binding = Action::None;
+            }
+            let mut definition: wave_behavior::Definition = serde_json::from_str(source).unwrap();
+            definition.enabled = true;
+            let id = definition.id.clone();
+            engine
+                .behaviors
+                .install(wave_behavior::Prepared::new(definition, key_code).unwrap());
+            engine.behaviors.dispatch(&Frame::default());
+            send(&mut engine, &[input]);
+            let emitted = output::KEYS.with_borrow(|events| !events.is_empty())
+                || output::MOUSE.with_borrow(|events| !events.is_empty());
+            assert!(emitted, "enabled {id} must produce its own output");
+            send(&mut engine, &[]);
+            engine.behaviors.enable(&id, false).unwrap();
+            engine.flush();
+            output::KEYS.with_borrow_mut(Vec::clear);
+            output::MOUSE.with_borrow_mut(Vec::clear);
+            // All inputs return to neutral before the next press.
+            send(&mut engine, &[]);
+            send(&mut engine, &[input]);
+            engine.last_tick = Instant::now() - Duration::from_millis(100);
+            engine.tick(Instant::now());
+            send(&mut engine, &[]);
+            output::KEYS
+                .with_borrow(|events| assert!(events.is_empty(), "disabled {id}: {events:?}"));
+            output::MOUSE
+                .with_borrow(|events| assert!(events.is_empty(), "disabled {id}: {events:?}"));
+            assert_eq!(
+                engine.behaviors.snapshots()[0].status,
+                wave_behavior::Status::Disabled
+            );
+        }
+    }
+    #[test]
+    fn script_switcher_owns_input_and_voice_cancels_its_resources() {
+        let mut engine = active();
+        let mut definition: wave_behavior::Definition =
+            serde_json::from_str(include_str!("../behaviors/app-switcher.json")).unwrap();
+        definition.enabled = true;
+        engine
+            .behaviors
+            .install(wave_behavior::Prepared::new(definition, key_code).unwrap());
+        engine.behaviors.dispatch(&Frame::default());
+        send(&mut engine, &["l1"]);
+        assert!(engine.switcher.is_none());
+        output::KEYS.with_borrow(|events| {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|(key, down, _)| *key == 48 && *down)
+                    .count(),
+                1
+            )
+        });
+        engine.input(&["l1".into()], true, true);
+        output::KEYS.with_borrow(|events| {
+            assert!(events.iter().any(|(key, down, _)| *key == 53 && *down));
+            assert!(events.iter().any(|(key, down, _)| *key == 55 && !down));
+        });
     }
     #[test]
     fn precision_trigger_overrides_acceleration() {

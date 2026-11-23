@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "id": "mouse-buttons",
+  "name": "规则示例 · X/Y 鼠标按钮",
+  "enabled": false,
+  "priority": 100,
+  "inputs": ["x", "y"],
+  "program": {
+    "type": "rules",
+    "rules": [
+      {"on": {"type": "press", "input": "x"}, "actions": [{"type": "mouse_down", "button": "left"}]},
+      {"on": {"type": "release", "input": "x"}, "actions": [{"type": "mouse_up", "button": "left"}]},
+      {"on": {"type": "press", "input": "y"}, "actions": [{"type": "mouse_down", "button": "right"}]},
+      {"on": {"type": "release", "input": "y"}, "actions": [{"type": "mouse_up", "button": "right"}]}
+    ]
+  }
+}

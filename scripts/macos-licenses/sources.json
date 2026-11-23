@@ -29,5 +29,9 @@
   },
   "0bb77cb3448100b8f560abf796014c8b85d75e23": {
     "wuff-0bb77cb-LICENSE.txt": "https://github.com/nicoburns/wuff/blob/0bb77cb3448100b8f560abf796014c8b85d75e23/LICENSE"
+  },
+  "aaf90906bfa7eae090fc236b8572a67528cab3ed": {
+    "rhai-aaf9090-LICENSE-APACHE.txt": "https://github.com/rhaiscript/rhai/blob/aaf90906bfa7eae090fc236b8572a67528cab3ed/LICENSE-APACHE.txt",
+    "rhai-aaf9090-LICENSE-MIT.txt": "https://github.com/rhaiscript/rhai/blob/aaf90906bfa7eae090fc236b8572a67528cab3ed/LICENSE-MIT.txt"
   }
 }

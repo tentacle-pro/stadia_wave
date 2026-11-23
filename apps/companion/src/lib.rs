@@ -1,4 +1,5 @@
 mod asr;
+mod behaviors;
 mod desktop;
 mod dictation;
 mod local_bridge;

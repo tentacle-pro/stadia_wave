@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "id": "app-switcher",
+  "name": "脚本示例 · L1 应用切换",
+  "enabled": false,
+  "priority": 200,
+  "inputs": [
+    "l1",
+    "dpad_left",
+    "dpad_right",
+    "dpad_down"
+  ],
+  "program": {
+    "type": "script",
+    "source": "fn on_event(event, state) {\n    if state == () {\n        state = #{active: false, cancelled: false, repeat_key: \"\", next_repeat: 0};\n    }\n    let actions = [];\n    if event.pressed.contains(\"l1\") {\n        state.active = true;\n        state.cancelled = false;\n        state.repeat_key = \"\";\n        actions.push(#{type: \"key_down\", key: \"cmd\"});\n        actions.push(#{type: \"key_tap\", key: \"Tab\"});\n    }\n    let handled = state.active;\n    if state.active && event.released.contains(\"l1\") {\n        actions.push(#{type: \"release_all\"});\n        state.active = false;\n        state.repeat_key = \"\";\n    } else if state.active && !state.cancelled {\n        if event.pressed.contains(\"dpad_down\") {\n            actions.push(#{type: \"key_tap\", key: \"Escape\"});\n            actions.push(#{type: \"release_all\"});\n            state.cancelled = true;\n            state.repeat_key = \"\";\n        } else {\n            for pair in [[\"dpad_left\", \"ArrowLeft\"], [\"dpad_right\", \"ArrowRight\"]] {\n                if event.pressed.contains(pair[0]) {\n                    actions.push(#{type: \"key_tap\", key: pair[1]});\n                    state.repeat_key = pair[0];\n                    state.next_repeat = event.time_ms + 450;\n                }\n            }\n            if state.repeat_key != \"\" && !event.held.contains(state.repeat_key) {\n                state.repeat_key = \"\";\n            }\n            if event.kind == \"tick\" && state.repeat_key != \"\" && event.time_ms >= state.next_repeat {\n                let key = if state.repeat_key == \"dpad_left\" { \"ArrowLeft\" } else { \"ArrowRight\" };\n                actions.push(#{type: \"key_tap\", key: key});\n                state.next_repeat = event.time_ms + 100;\n            }\n        }\n    }\n    #{handled: handled, actions: actions, state: state}\n}"
+  },
+  "on_cancel": [
+    {
+      "type": "key_tap",
+      "key": "Escape"
+    }
+  ]
+}
