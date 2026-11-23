@@ -273,7 +273,11 @@ fn connection(
         )
 }
 
-pub fn overview(model: Signal<ViewState>, endpoint: Signal<String>) -> impl IntoElement {
+pub fn overview(
+    model: Signal<ViewState>,
+    endpoint: Signal<String>,
+    bridge_connections: impl IntoElement,
+) -> impl IntoElement {
     let bridge_notice = signal(String::new());
     let bridge_status = signal(crate::local_bridge::status());
     let authorized = signal(desktop::authorized());
@@ -340,7 +344,7 @@ pub fn overview(model: Signal<ViewState>, endpoint: Signal<String>) -> impl Into
                         let bridge = state.bridges.into_iter().find(|bridge| Some(&bridge.id) == state.active_bridge.as_ref());
                         view()
                             .child(row("名称", bridge.as_ref().map(|bridge| bridge.name.clone()).unwrap_or_else(|| "未连接".into())))
-                            .child(row("地址", bridge.map(|bridge| format!("{}:{}", bridge.address, bridge.port)).unwrap_or_else(|| "—".into())))
+                            .child(row("地址", bridge.map(|bridge| if bridge.id == crate::network::LOCAL_ID { bridge.address } else { format!("{}:{}", bridge.address, bridge.port) }).unwrap_or_else(|| "—".into())))
                             .child(row("Stadiacast", if state.connected { state.hardware.message } else { "等待 Bridge".into() }))
                             .child(row("版本", state.hardware.version.unwrap_or_else(|| "未知".into())))
                     }))
@@ -363,6 +367,7 @@ pub fn overview(model: Signal<ViewState>, endpoint: Signal<String>) -> impl Into
                             }).child(control().child(text("停止")))))
                         .child(text(move || bridge_status.get()).text_size(px(12.0)).text_color(rgb(MUTED)))
                         .child(when(move || !bridge_notice.get().is_empty(), move || text(move || bridge_notice.get()).text_size(px(12.0)))))
+                    .child(bridge_connections)
                     .child(link("部署 Bridge 的多种方式", "https://github.com/tentacle-pro/stadia_wave#readme")))
                 .child(vertical_rule())
                 .child(view().flex_1().gap_2()
@@ -407,123 +412,147 @@ fn metric(label: &'static str, value: impl Fn() -> String + 'static) -> impl Int
         .child(text(label).text_color(rgb(MUTED)))
 }
 
-pub(crate) fn bridge_settings(
+pub(crate) fn bridge_connections(
     model: Signal<ViewState>,
     selected: Signal<String>,
-    path: Signal<String>,
     auto_connect: Signal<bool>,
     commands: tokio::sync::mpsc::UnboundedSender<Command>,
 ) -> impl IntoElement {
-    let connect = commands.clone();
+    let bridges = computed(move || model.get().bridges);
+    let connection = computed(move || {
+        let state = model.get();
+        (
+            state.active_bridge,
+            state.connecting_bridge,
+            state.pairing_required,
+        )
+    });
+    let form = signal(None::<String>);
+    let code = signal(String::new());
+    let connect = {
+        let commands = commands.clone();
+        move |bridge: crate::network::Bridge, invitation_path: String| {
+            auto_connect.set(false);
+            selected.set(bridge.id.clone());
+            let _ = Storage::set_item("bridge.selected", bridge.id.clone());
+            let _ = Storage::set_item("bridge.autoconnect", "true");
+            let _ = commands.send(Command::Connect {
+                bridge,
+                invitation_path,
+            });
+        }
+    };
+    let disconnect = move || {
+        auto_connect.set(false);
+        let _ = Storage::set_item("bridge.autoconnect", "false");
+        let _ = commands.send(Command::Disconnect);
+    };
+    let disconnect_missing = disconnect.clone();
     view()
-        .gap_3()
-        .child(heading("Bridge 连接", 22.0))
-        .child(text(move || model.get().status).text_color(rgb(MUTED)))
-        .child(text("局域网中的 Bridge").font_weight(FontWeight::SEMIBOLD))
+        .gap_2()
+        .child(text("可用 Bridge").font_weight(FontWeight::SEMIBOLD))
+        .child(text(move || model.get().status).text_size(px(12.0)).text_color(rgb(MUTED)))
         .child(when(
-            move || model.get().bridges.is_empty(),
-            || {
-                text("未发现 Bridge。请启动 Bridge，并确认已允许 Companion 访问局域网。")
-                    .text_color(rgb(MUTED))
-            },
+            move || bridges.get().is_empty(),
+            || text("暂无扫描结果").text_size(px(12.0)).text_color(rgb(MUTED)),
         ))
         .child(dynamic(move || {
-            model
-                .get()
-                .bridges
-                .into_iter()
-                .map(move |bridge| {
-                    let id = bridge.id.clone();
-                    let selected_id = id.clone();
-                    button()
-                        .selected(move || selected.get() == selected_id)
-                        .on_press(move || {
-                            let _ = Storage::set_item("bridge.selected", id.clone());
-                            selected.set(id.clone());
-                        })
-                        .child(
-                            control()
-                                .bg(move || {
-                                    rgb(if selected.get() == bridge.id {
-                                        0xc3e6df
-                                    } else {
-                                        SURFACE
-                                    })
+            bridges.get().into_iter().map(|bridge| {
+                let id = bridge.id.clone();
+                let local = id == crate::network::LOCAL_ID;
+                let uses_code = bridge.short_pairing;
+                let row_state = {
+                    let id = id.clone();
+                    move || {
+                        let (active, pending, needs_pairing) = connection.get();
+                        (active.as_ref() == Some(&id), pending.as_ref() == Some(&id),
+                            needs_pairing.as_ref() == Some(&id))
+                    }
+                };
+                let label = row_state.clone();
+                let action = row_state.clone();
+                let open = {
+                    let id = id.clone();
+                    move || form.get().as_ref() == Some(&id)
+                };
+                let open_for_label = open.clone();
+                let connect_row = connect.clone();
+                let connect_form = connect.clone();
+                let disconnect_row = disconnect.clone();
+                let target = bridge.clone();
+                let submit = bridge.clone();
+                view().gap_2().p_2().rounded_md().bg(rgb(SURFACE))
+                    .child(view().flex_row().items_center().gap_2().flex_wrap()
+                        .child(view().flex_1().gap_1()
+                            .child(text(if local { "本机 Bridge".into() } else { bridge.name })
+                                .font_weight(FontWeight::SEMIBOLD))
+                            .child(text(if local { "Unix Socket".into() } else {
+                                format!("{}:{}", bridge.address, bridge.port)
+                            }).text_size(px(12.0)).text_color(rgb(MUTED))))
+                        .child(button()
+                            .on_press(move || {
+                                let (active, pending, needs_pairing) = action();
+                                let was_open = form.get().as_ref() == Some(&id);
+                                form.set(None);
+                                code.set(String::new());
+                                if active || pending {
+                                    disconnect_row();
+                                } else if !local && needs_pairing {
+                                    if !was_open { form.set(Some(id.clone())); }
+                                } else {
+                                    connect_row(target.clone(), String::new());
+                                }
+                            })
+                            .child(control().bg(rgb(0xc3e6df)).child(text(move || {
+                                match label() {
+                                    (true, _, _) => "断开",
+                                    (_, true, _) => "取消连接",
+                                    (_, _, true) if open_for_label() => "收起",
+                                    (_, _, true) => "配对",
+                                    _ => "连接",
+                                }
+                            })))))
+                    .child(when(open, move || {
+                        let connect_form = connect_form.clone();
+                        let submit = submit.clone();
+                        view().gap_2()
+                            .child(text(if uses_code {
+                                "在 Bridge 主机运行 wave-bridge pair，输入终端显示的 8 位码。"
+                            } else {
+                                "输入 Bridge 提供的 pairing.json 路径。"
+                            }).text_size(px(12.0)).text_color(rgb(MUTED)))
+                            .child(input().value(move || code.get())
+                                .placeholder(if uses_code { "8 位配对码" } else { "配对文件路径" })
+                                .on_change(move |value: &str| code.set(value.to_owned()))
+                                .h(px(36.0)).p_2().rounded_md().border(px(1.0)).border_color(rgb(RULE)))
+                            .child(text("配对成功后，凭据将保存到此 Mac 的钥匙串，供下次连接。")
+                                .text_size(px(12.0)).text_color(rgb(MUTED)))
+                            .child(button()
+                                .disabled(move || {
+                                    let value = code.get();
+                                    let value = value.trim();
+                                    if uses_code {
+                                        value.len() != 8 || !value.bytes().all(|byte| byte.is_ascii_digit())
+                                    } else { value.is_empty() }
                                 })
-                                .child(text(format!(
-                                    "{}  ·  {}:{}",
-                                    bridge.name, bridge.address, bridge.port
-                                ))),
-                        )
-                })
-                .collect::<Vec<_>>()
+                                .on_press(move || {
+                                    let value = code.get().trim().to_owned();
+                                    code.set(String::new());
+                                    form.set(None);
+                                    connect_form(submit.clone(), value);
+                                })
+                                .child(control().bg(rgb(0xc3e6df)).child(text("配对并连接"))))
+                    }))
+            }).collect::<Vec<_>>()
         }))
-        .child(
-            view()
-                .gap_2()
-                .pt_2()
-                .child(text("首次配对文件路径").font_weight(FontWeight::SEMIBOLD))
-                .child(
-                    input()
-                        .value(move || path.get())
-                        .placeholder("/…/bridge/pairing.json")
-                        .on_change(move |value: &str| path.set(value.to_owned()))
-                        .h(px(38.0))
-                        .p_2()
-                        .rounded_md()
-                        .border(px(1.0))
-                        .border_color(rgb(RULE)),
-                )
-                .child(
-                    text("首次连接使用 Bridge 提供的 pairing.json。已配对的 Bridge 可直接连接。")
-                        .text_size(px(13.0))
-                        .text_color(rgb(MUTED)),
-                )
-                .child(
-                    text("配对凭据存于 macOS 钥匙串。读取时，系统可能要求输入 Mac 登录密码。")
-                        .text_size(px(13.0))
-                        .text_color(rgb(MUTED)),
-                ),
-        )
-        .child(
-            view()
-                .flex_row()
-                .gap_2()
-                .child(
-                    button()
-                        .disabled(move || {
-                            !model
-                                .get()
-                                .bridges
-                                .iter()
-                                .any(|bridge| bridge.id == selected.get())
-                        })
-                        .on_press(move || {
-                            if let Some(bridge) = model
-                                .get()
-                                .bridges
-                                .into_iter()
-                                .find(|bridge| bridge.id == selected.get())
-                            {
-                                let _ = Storage::set_item("bridge.autoconnect", "true");
-                                let _ = connect.send(Command::Connect {
-                                    bridge,
-                                    invitation_path: path.get(),
-                                });
-                            }
-                        })
-                        .child(control().bg(rgb(0xc3e6df)).child(text("连接"))),
-                )
-                .child(
-                    button()
-                        .on_press(move || {
-                            let _ = Storage::set_item("bridge.autoconnect", "false");
-                            auto_connect.set(false);
-                            let _ = commands.send(Command::Disconnect);
-                        })
-                        .child(control().child(text("断开"))),
-                ),
-        )
+        .child(when(move || {
+            let (active, pending, _) = connection.get();
+            let current = pending.or(active);
+            current.is_some_and(|id| !bridges.get().iter().any(|bridge| bridge.id == id))
+        }, move || {
+            let disconnect = disconnect_missing.clone();
+            button().on_press(disconnect).child(control().child(text("断开")))
+        }))
 }
 
 pub(crate) fn asr_settings(

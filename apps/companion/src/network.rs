@@ -27,6 +27,7 @@ pub struct Bridge {
     pub name: String,
     pub address: String,
     pub port: u16,
+    pub short_pairing: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -35,6 +36,8 @@ pub struct ViewState {
     pub status: String,
     pub connected: bool,
     pub active_bridge: Option<String>,
+    pub connecting_bridge: Option<String>,
+    pub pairing_required: Option<String>,
     pub heartbeats: u64,
     pub latency: Vec<Option<f64>>,
     pub axes: [i32; 4],
@@ -56,6 +59,8 @@ impl Default for ViewState {
             status: "正在通过 Bonjour 发现 Bridge…".into(),
             connected: false,
             active_bridge: None,
+            connecting_bridge: None,
+            pairing_required: None,
             heartbeats: 0,
             latency: vec![],
             axes: [0; 4],
@@ -131,6 +136,8 @@ fn start_worker(profile: String, dictation: Option<Dictation>) -> Worker {
     }
 }
 
+pub(crate) const LOCAL_ID: &str = "@local";
+
 async fn run(
     state: Arc<Mutex<ViewState>>,
     mut commands: mpsc::UnboundedReceiver<Command>,
@@ -151,6 +158,9 @@ async fn run(
                     let Some(id) = service.get_property_val_str("bridge_id") else {
                         continue;
                     };
+                    if id == LOCAL_ID {
+                        continue;
+                    }
                     if service.get_property_val_str("version") != Some(&VERSION.to_string()) {
                         continue;
                     }
@@ -168,6 +178,8 @@ async fn run(
                             .into(),
                         address: address.to_string(),
                         port: service.port,
+                        short_pairing: service.get_property_val_str("pairing")
+                            == Some("short-code"),
                     };
                     state.bridges.retain(|entry| entry.id != id);
                     state.bridges.push(bridge);
@@ -181,6 +193,31 @@ async fn run(
                 }
                 _ => {}
             }
+        }
+    });
+
+    let local_state = state.clone();
+    let local_discovery = tokio::spawn(async move {
+        loop {
+            let available = crate::local_bridge::available();
+            {
+                let mut view = local_state.lock().unwrap();
+                if available && !view.bridges.iter().any(|bridge| bridge.id == LOCAL_ID) {
+                    view.bridges.insert(
+                        0,
+                        Bridge {
+                            id: LOCAL_ID.into(),
+                            name: "Wave Bridge · 本机".into(),
+                            address: "Unix Socket".into(),
+                            port: 0,
+                            short_pairing: false,
+                        },
+                    );
+                } else if !available {
+                    view.bridges.retain(|bridge| bridge.id != LOCAL_ID);
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
 
@@ -228,6 +265,7 @@ async fn run(
                             target = None;
                             let mut view = state.lock().unwrap();
                             view.retrying = false;
+                            view.connecting_bridge = None;
                             view.status = "已断开".into();
                         }
                         None => break,
@@ -250,7 +288,12 @@ async fn run(
         {
             bridge = updated;
         }
-        state.lock().unwrap().status = format!("正在连接 {}…", bridge.name);
+        let bridge_id = bridge.id.clone();
+        {
+            let mut view = state.lock().unwrap();
+            view.connecting_bridge = Some(bridge_id.clone());
+            view.status = format!("正在连接 {}…", bridge.name);
+        }
         let (device_commands, device_rx) = mpsc::unbounded_channel();
         let session_state = state.clone();
         let session_profile = profile.clone();
@@ -279,6 +322,7 @@ async fn run(
                 let mut view = state.lock().unwrap();
                 view.connected = false;
                 view.active_bridge = None;
+                view.connecting_bridge = None;
                 view.session_id = None;
                 clear_recording(&mut view, dictation.as_ref());
                 view.hardware = HardwareState::default();
@@ -308,19 +352,31 @@ async fn run(
             break outcome;
         };
         let mut view = state.lock().unwrap();
+        if view.connected
+            && let Some((_, invitation)) = target.as_mut()
+        {
+            invitation.clear();
+        }
         view.connected = false;
         view.active_bridge = None;
         view.session_id = None;
         clear_recording(&mut view, dictation.as_ref());
         view.hardware = HardwareState::default();
         view.retrying = false;
+        view.connecting_bridge = None;
         log::info!("Connection ended; evaluating recovery");
         match result {
             Ok(Ok(Exit::Retry(message))) => {
                 view.status = format!("连接中断，正在重连：{message}");
                 view.retrying = true;
+                view.connecting_bridge = Some(bridge_id);
                 takeover = false;
                 waiting = true;
+            }
+            Ok(Ok(Exit::PairingRequired(message))) => {
+                view.pairing_required = Some(bridge_id);
+                view.status = message.into();
+                target = None;
             }
             Ok(Ok(Exit::Replaced)) => {
                 view.status = "连接已被接管。点击连接可重新接管。".into();
@@ -340,6 +396,7 @@ async fn run(
             }
         }
     }
+    local_discovery.abort();
     discovery.abort();
     daemon.shutdown()?;
     Ok(())
@@ -368,8 +425,47 @@ fn profile_keyring_entry(bridge_id: &str, profile: &str) -> Result<keyring::Entr
 
 enum Exit {
     Retry(String),
+    PairingRequired(&'static str),
     Replaced,
     Busy,
+}
+
+async fn bootstrap_pairing(bridge: &Bridge, code: &str) -> Result<(String, String)> {
+    use wave_protocol::pairing::{self, Challenge, Ed25519Group, Password, Spake2};
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let (a, b) = pairing::identities();
+        let (exchange, message) =
+            Spake2::<Ed25519Group>::start_a(&Password::new(code.as_bytes()), &a, &b);
+        let tcp = TcpStream::connect((bridge.address.as_str(), bridge.port)).await?;
+        let (mut socket, _) =
+            client_async(format!("ws://{}:{}/ws", bridge.address, bridge.port), tcp).await?;
+        let request = ClientMessage::PairingHello { message };
+        socket
+            .send(Message::Text(serde_json::to_string(&request)?.into()))
+            .await?;
+        let message = socket
+            .next()
+            .await
+            .context("配对窗口不可用，请在 Bridge 上重新生成配对码")??;
+        let challenge: Challenge = serde_json::from_str(message.to_text()?)?;
+        if challenge.id != bridge.id {
+            bail!("配对返回的 Bridge 身份与扫描结果不一致");
+        }
+        let secret = exchange
+            .finish(&challenge.message)
+            .map_err(|_| anyhow::anyhow!("配对握手失败"))?;
+        let key = pairing::key(&secret);
+        ring::hmac::verify(
+            &key,
+            &pairing::transcript("server-proof", &challenge.id, &challenge.certificate_pem),
+            &challenge.proof,
+        )
+        .map_err(|_| anyhow::anyhow!("配对码不正确，或无法验证 Bridge 身份"))?;
+        let token = pairing::grant(&key, &challenge.id, &challenge.certificate_pem);
+        Ok((challenge.certificate_pem, token))
+    })
+    .await
+    .context("短码配对超时")?
 }
 
 async fn session(
@@ -381,64 +477,117 @@ async fn session(
     mut device_commands: mpsc::UnboundedReceiver<String>,
     dictation: Option<&Dictation>,
 ) -> Result<Exit> {
-    let entry = profile_keyring_entry(&bridge.id, profile)?;
-    let saved = match entry.get_password() {
-        Ok(value) => Some(serde_json::from_str::<Credential>(&value)?),
-        Err(keyring::Error::NoEntry) => None,
-        Err(error) => return Err(error.into()),
-    };
-    let (cert, auth, companion_id) = if let Some(saved) = saved {
-        if saved.bridge_id != bridge.id {
-            bail!("Stored Bridge identity mismatch");
-        }
+    trait Transport: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+    impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Transport for T {}
+    let local = bridge.id == LOCAL_ID;
+    let (auth, remote) = if local {
         (
-            saved.certificate_pem,
-            ClientMessage::Connect {
+            ClientMessage::LocalConnect {
                 version: VERSION,
-                companion_id: saved.companion_id.clone(),
-                token: saved.token,
                 takeover,
             },
-            saved.companion_id,
+            None,
         )
     } else {
-        let invitation: Invitation = serde_json::from_slice(
-            &fs::read(Path::new(invitation_path.trim()))
-                .context("请选择 Bridge 生成的 pairing.json 文件")?,
-        )?;
-        if invitation.bridge_id != bridge.id {
-            bail!("配对文件与所选 Bridge 不匹配");
+        let entry = profile_keyring_entry(&bridge.id, profile)?;
+        let code = invitation_path.trim();
+        let short_pairing = bridge.short_pairing && !code.is_empty();
+        if short_pairing && !(code.len() == 8 && code.bytes().all(|byte| byte.is_ascii_digit())) {
+            bail!("请输入 8 位配对码");
         }
-        let companion_id = Uuid::new_v4().to_string();
-        (
-            invitation.certificate_pem,
-            ClientMessage::Pair {
-                version: VERSION,
-                companion_id: companion_id.clone(),
-                name: "Wave Companion".into(),
-                token: invitation.pairing_token,
-                takeover,
-            },
-            companion_id,
-        )
+        let saved = if short_pairing {
+            None
+        } else {
+            match entry.get_password() {
+                Ok(value) => match serde_json::from_str::<Credential>(&value) {
+                    Ok(credential) if credential.bridge_id == bridge.id => Some(credential),
+                    _ => return Ok(Exit::PairingRequired("保存的凭据无效，请重新配对。")),
+                },
+                Err(keyring::Error::NoEntry) => None,
+                Err(_) => {
+                    return Ok(Exit::PairingRequired(
+                        "无法读取钥匙串凭据。可重新配对，或在钥匙串中恢复访问。",
+                    ));
+                }
+            }
+        };
+        let (cert, auth, companion_id) = if let Some(saved) = saved {
+            (
+                saved.certificate_pem,
+                ClientMessage::Connect {
+                    version: VERSION,
+                    companion_id: saved.companion_id.clone(),
+                    token: saved.token,
+                    takeover,
+                },
+                saved.companion_id,
+            )
+        } else if short_pairing {
+            let (cert, token) = bootstrap_pairing(bridge, code).await?;
+            let companion_id = Uuid::new_v4().to_string();
+            (
+                cert,
+                ClientMessage::Pair {
+                    version: VERSION,
+                    companion_id: companion_id.clone(),
+                    name: "Wave Companion".into(),
+                    token,
+                    takeover,
+                },
+                companion_id,
+            )
+        } else {
+            if code.is_empty() || bridge.short_pairing {
+                return Ok(Exit::PairingRequired("需要配对才能连接这台 Bridge。"));
+            }
+            let invitation: Invitation = serde_json::from_slice(
+                &fs::read(Path::new(invitation_path.trim()))
+                    .context("请选择 Bridge 生成的 pairing.json 文件")?,
+            )?;
+            if invitation.bridge_id != bridge.id {
+                bail!("配对文件与所选 Bridge 不匹配");
+            }
+            let companion_id = Uuid::new_v4().to_string();
+            (
+                invitation.certificate_pem,
+                ClientMessage::Pair {
+                    version: VERSION,
+                    companion_id: companion_id.clone(),
+                    name: "Wave Companion".into(),
+                    token: invitation.pairing_token,
+                    takeover,
+                },
+                companion_id,
+            )
+        };
+        (auth, Some((entry, cert, companion_id)))
     };
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut BufReader::new(cert.as_bytes())) {
-        roots.add(cert?)?;
-    }
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
     let socket = tokio::time::timeout(Duration::from_secs(10), async {
-        let tcp = TcpStream::connect((bridge.address.as_str(), bridge.port)).await?;
-        let tls = TlsConnector::from(Arc::new(config))
-            .connect(ServerName::try_from("stadia-wave.local")?, tcp)
-            .await?;
-        anyhow::Ok(
-            client_async(format!("wss://{}:{}/ws", bridge.address, bridge.port), tls)
-                .await?
-                .0,
-        )
+        let (stream, url): (Box<dyn Transport>, String) = if let Some((_, cert, _)) = &remote {
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in rustls_pemfile::certs(&mut BufReader::new(cert.as_bytes())) {
+                roots.add(cert?)?;
+            }
+            let config = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let tcp = TcpStream::connect((bridge.address.as_str(), bridge.port)).await?;
+            let tls = TlsConnector::from(Arc::new(config))
+                .connect(ServerName::try_from("stadia-wave.local")?, tcp)
+                .await?;
+            (
+                Box::new(tls),
+                format!("wss://{}:{}/ws", bridge.address, bridge.port),
+            )
+        } else {
+            let stream =
+                tokio::net::UnixStream::connect(crate::local_bridge::socket_path()).await?;
+            if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
+                bail!("本机 Bridge 的系统用户不匹配");
+            }
+            (Box::new(stream), "ws://localhost/ws".into())
+        };
+        anyhow::Ok(client_async(url, stream).await?.0)
     })
     .await;
     let mut socket = match socket {
@@ -454,6 +603,7 @@ async fn session(
         let mut ping_at = std::collections::HashMap::new();
         let mut last_received = tokio::time::Instant::now();
         let mut current_session: Option<String> = None;
+        let mut keychain_warning = None;
         let mut incoming_audio: Option<IncomingAudio> = None;
         loop {
             tokio::select! {
@@ -486,26 +636,35 @@ async fn session(
                     last_received = tokio::time::Instant::now();
                     match message {
                         Message::Text(text) => match serde_json::from_str::<ServerMessage>(&text)? {
+                            ServerMessage::PairingCode { .. } => bail!("Unexpected local control message"),
                             ServerMessage::Paired { token } => {
+                                let Some((entry, cert, companion_id)) = &remote else { bail!("Unexpected pairing response on local connection"); };
                                 let credential = Credential {
                                     bridge_id: bridge.id.clone(), certificate_pem: cert.clone(),
                                     companion_id: companion_id.clone(), token,
                                 };
-                                // Keychain errors are terminal; retrying would consume another invitation.
+                                // Keep this session usable even if Keychain cannot persist the new token.
                                 if let Err(error) = entry.set_password(&serde_json::to_string(&credential)?) {
-                                    return Err(anyhow::anyhow!("无法保存 Keychain 配对凭据：{error}"));
+                                    keychain_warning = Some(format!("钥匙串保存失败，下次连接需重新配对（{error}）"));
                                 }
                             }
                             ServerMessage::Connected { bridge_id, session_id } => {
-                                if bridge_id != bridge.id { bail!("Bridge identity mismatch"); }
+                                if !local && bridge_id != bridge.id { bail!("Bridge identity mismatch"); }
                                 current_session = Some(session_id.clone());
                                 let mut state = state.lock().unwrap();
                                 state.connected = true;
-                                state.active_bridge = Some(bridge_id);
+                                state.active_bridge = Some(bridge.id.clone());
+                                state.connecting_bridge = None;
+                                if state.pairing_required.as_ref() == Some(&bridge.id) {
+                                    state.pairing_required = None;
+                                }
                                 state.retrying = false;
                                 state.session_id = Some(session_id);
                                 state.heartbeats = 0;
-                                state.status = format!("已连接 {} · WSS 已认证", bridge.name);
+                                state.status = format!("已连接 {} · {}", bridge.name, if local { "本机直连" } else { "WSS 已认证" });
+                                if let Some(warning) = &keychain_warning {
+                                    state.status.push_str(&format!(" · {warning}"));
+                                }
                                 log::info!("CONNECTED {} via {}:{}", bridge.id, bridge.address, bridge.port);
                             }
                             ServerMessage::Status { .. } => {}
@@ -569,6 +728,9 @@ async fn session(
                             ServerMessage::Pong { .. } => {}
                             ServerMessage::Replaced => return Ok(Exit::Replaced),
                             ServerMessage::Busy => return Ok(Exit::Busy),
+                            ServerMessage::Error { message } if !local && message == "Authentication failed" => {
+                                return Ok(Exit::PairingRequired("Bridge 已拒绝保存的凭据，请重新配对。"));
+                            }
                             ServerMessage::Error { message } => return Err(anyhow::anyhow!(message)),
                         },
                         Message::Binary(data) => {

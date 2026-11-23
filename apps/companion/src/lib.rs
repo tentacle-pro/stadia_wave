@@ -103,7 +103,6 @@ pub fn App() -> impl IntoElement {
     let selected = signal(Storage::get_item("bridge.selected").unwrap_or_default());
     let auto_connect = signal(Storage::get_item("bridge.autoconnect").as_deref() == Some("true"));
     let reconnect = worker.commands.clone();
-    let path = signal(String::new());
     let shared = worker.state;
     mapping::start(shared.clone(), dictation.clone());
     set_interval(Duration::from_millis(150), move || {
@@ -147,7 +146,7 @@ pub fn App() -> impl IntoElement {
             model.set(next);
         }
     });
-    let settings_commands = worker.commands.clone();
+    let bridge_commands = worker.commands.clone();
     let rumble = worker.commands.clone();
     view()
         .flex_1()
@@ -355,7 +354,18 @@ pub fn App() -> impl IntoElement {
                             .gap_4()
                             .child(when(
                                 move || page.get() == 0,
-                                move || pages::overview(model, endpoint),
+                                move || {
+                                    pages::overview(
+                                        model,
+                                        endpoint,
+                                        pages::bridge_connections(
+                                            model,
+                                            selected,
+                                            auto_connect,
+                                            bridge_commands.clone(),
+                                        ),
+                                    )
+                                },
                             ))
                             .child(when(
                                 move || page.get() == 1,
@@ -371,13 +381,6 @@ pub fn App() -> impl IntoElement {
                                                 .text_size(px(33.0))
                                                 .font_weight(FontWeight::SEMIBOLD),
                                         )
-                                        .child(pages::bridge_settings(
-                                            model,
-                                            selected,
-                                            path,
-                                            auto_connect,
-                                            settings_commands.clone(),
-                                        ))
                                         .child(pages::rule())
                                         .child(pages::asr_settings(
                                             endpoint,

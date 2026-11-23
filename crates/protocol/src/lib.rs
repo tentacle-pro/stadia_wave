@@ -23,6 +23,14 @@ pub struct Credential {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
+    IssuePairingCode,
+    PairingHello {
+        message: Vec<u8>,
+    },
+    LocalConnect {
+        version: u32,
+        takeover: bool,
+    },
     Pair {
         version: u32,
         companion_id: String,
@@ -54,6 +62,9 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    PairingCode {
+        code: String,
+    },
     Paired {
         token: String,
     },
@@ -138,3 +149,5 @@ pub struct ControllerState {
     #[serde(default)]
     pub ip: Option<String>,
 }
+
+pub mod pairing;

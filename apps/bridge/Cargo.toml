@@ -23,3 +23,5 @@ sha2.workspace = true
 hex.workspace = true
 
 reqwest.workspace = true
+
+ring = "0.17"

@@ -17,17 +17,15 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, UnixListener},
     sync::{Mutex, oneshot},
 };
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use uuid::Uuid;
-use wave_protocol::{
-    ClientMessage, DEFAULT_PORT, Invitation, SERVICE_TYPE, ServerMessage, VERSION,
-};
+use wave_protocol::{ClientMessage, Invitation, SERVICE_TYPE, ServerMessage, VERSION};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Identity {
     id: String,
     certificate_pem: String,
@@ -45,9 +43,78 @@ struct State {
     identity: Identity,
     path: PathBuf,
     invitation: Invitation,
+    short_pairing: bool,
+    pairing: Option<PairingWindow>,
     active: Option<Active>,
     name: String,
     device: stadiacast::Handle,
+}
+
+struct PairingWindow {
+    code: String,
+    deadline: tokio::time::Instant,
+    attempts: u8,
+    grants: Vec<String>,
+}
+
+impl PairingWindow {
+    fn new() -> Result<Self> {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let random = SystemRandom::new();
+        let code = loop {
+            let mut bytes = [0; 4];
+            random
+                .fill(&mut bytes)
+                .map_err(|_| anyhow::anyhow!("Secure random unavailable"))?;
+            let value = u32::from_ne_bytes(bytes);
+            if value < 4_200_000_000 {
+                break format!("{:08}", value % 100_000_000);
+            }
+        };
+        Ok(Self {
+            code,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(300),
+            attempts: 5,
+            grants: Vec::new(),
+        })
+    }
+
+    fn valid(&self) -> bool {
+        tokio::time::Instant::now() < self.deadline
+    }
+}
+
+async fn print_pairing_code(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let directory = fs::symlink_metadata(path.parent().context("Missing socket directory")?)?;
+    if !directory.is_dir() || directory.permissions().mode() & 0o077 != 0 {
+        bail!("Bridge socket directory must be private");
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let stream = tokio::net::UnixStream::connect(path)
+            .await
+            .context("Connect to the running Bridge (--remote)")?;
+        if stream.peer_cred()?.uid() != directory.uid() {
+            bail!("Bridge socket owner mismatch");
+        }
+        let (mut socket, _) = tokio_tungstenite::client_async("ws://localhost/ws", stream).await?;
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ClientMessage::IssuePairingCode)?.into(),
+            ))
+            .await?;
+        let response = socket
+            .next()
+            .await
+            .context("Bridge closed the control socket")??;
+        match serde_json::from_str(response.to_text()?)? {
+            ServerMessage::PairingCode { code } => println!("{code}"),
+            ServerMessage::Error { message } => bail!("{message}"),
+            _ => bail!("Unexpected pairing response"),
+        }
+        Ok(())
+    })
+    .await?
 }
 
 fn unix_seconds() -> u64 {
@@ -96,8 +163,9 @@ async fn main() -> Result<()> {
     let option = |key: &str| args.windows(2).find(|v| v[0] == key).map(|v| v[1].clone());
     if args.iter().any(|arg| arg == "--help") {
         println!(
-            "wave-bridge [--name NAME] [--port PORT] [--data-dir PATH] [--stadiacast PATH --controller-ip IP --advertise-ip IP --dns-upstream IP]"
+            "wave-bridge [--remote] [--name NAME] [--port PORT] [--data-dir PATH] [--stadiacast PATH --controller-ip IP --advertise-ip IP --dns-upstream IP]"
         );
+        println!("wave-bridge pair [--data-dir PATH]");
         return Ok(());
     }
     let data = option("--data-dir").map(PathBuf::from).unwrap_or_else(|| {
@@ -106,17 +174,57 @@ async fn main() -> Result<()> {
             .data_dir()
             .to_path_buf()
     });
+    let socket_path = data.join("bridge.sock");
+    if args.get(1).is_some_and(|arg| arg == "pair") {
+        return print_pairing_code(&socket_path).await;
+    }
+    let short_pairing = args.iter().any(|arg| arg == "--remote");
     fs::create_dir_all(&data)?;
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&data, fs::Permissions::from_mode(0o700))?;
-    let port: u16 = option("--port")
-        .map(|s| s.parse())
-        .transpose()?
-        .unwrap_or(DEFAULT_PORT);
-    // Bind before loading or modifying state, so a second instance cannot rotate pairing information.
-    let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
-        .await
-        .context("Bridge port unavailable")?;
+    let port: Option<u16> = option("--port").map(|s| s.parse()).transpose()?;
+    let port = port.or(short_pairing.then_some(wave_protocol::DEFAULT_PORT));
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(data.join("bridge.lock"))?;
+    lock.try_lock()
+        .context("Bridge already running or data directory cannot be locked")?;
+    let local = if port.is_none() || short_pairing {
+        match fs::symlink_metadata(&socket_path) {
+            Ok(metadata) => {
+                use std::os::unix::fs::FileTypeExt;
+                if !metadata.file_type().is_socket() {
+                    bail!("Bridge socket path is occupied by a non-socket");
+                }
+                if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+                    bail!("Bridge socket is already accepting connections");
+                }
+                fs::remove_file(&socket_path)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let local = UnixListener::bind(&socket_path).context("Bridge socket unavailable")?;
+        struct RemoveSocket(PathBuf);
+        impl Drop for RemoveSocket {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let remove_socket = RemoveSocket(socket_path.clone());
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::MetadataExt;
+        let local_uid = fs::metadata(&socket_path)?.uid();
+        Some((local, remove_socket, local_uid))
+    } else {
+        None
+    };
+    let listener = match port {
+        Some(port) => Some(TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await?),
+        None => None,
+    };
     let path = data.join("identity.json");
     let identity: Identity = if path.exists() {
         serde_json::from_slice(&fs::read(&path)?)?
@@ -148,32 +256,45 @@ async fn main() -> Result<()> {
         pairing_token: Uuid::new_v4().to_string(),
         expires_at: unix_seconds() + 600,
     };
-    private_write(
-        &data.join("pairing.json"),
-        &serde_json::to_vec_pretty(&invitation)?,
-    )?;
     let name = option("--name").unwrap_or_else(|| "Wave Bridge".into());
-    let daemon = ServiceDaemon::new()?;
-    let properties = [
-        ("version", VERSION.to_string()),
-        ("bridge_id", identity.id.clone()),
-    ];
-    let hostname = format!("wave-{}.local.", identity.id);
-    let service = ServiceInfo::new(
-        SERVICE_TYPE,
-        &format!("{} {}", name, &identity.id[..8]),
-        &hostname,
-        "",
-        port,
-        &properties[..],
-    )?
-    .enable_addr_auto();
-    let fullname = service.get_fullname().to_owned();
-    daemon.register(service)?;
-    println!(
-        "Bridge ready: {name}\nPort: {port}\nCertificate SHA-256: {fingerprint}\nPairing invitation (valid 10 minutes, one use): {}",
-        data.join("pairing.json").display()
-    );
+    let advertisement = if let Some(port) = port {
+        if short_pairing {
+            match fs::remove_file(data.join("pairing.json")) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            private_write(
+                &data.join("pairing.json"),
+                &serde_json::to_vec_pretty(&invitation)?,
+            )?;
+        }
+        let daemon = ServiceDaemon::new()?;
+        let properties = [
+            ("version", VERSION.to_string()),
+            ("bridge_id", identity.id.clone()),
+            (
+                "pairing",
+                if short_pairing { "short-code" } else { "file" }.to_owned(),
+            ),
+        ];
+        let hostname = format!("wave-{}.local.", identity.id);
+        let service = ServiceInfo::new(
+            SERVICE_TYPE,
+            &format!("{} {}", name, &identity.id[..8]),
+            &hostname,
+            "",
+            port,
+            &properties[..],
+        )?
+        .enable_addr_auto();
+        let fullname = service.get_fullname().to_owned();
+        daemon.register(service)?;
+        Some((daemon, fullname))
+    } else {
+        None
+    };
     let config_path = data.join("stadiacast.json");
     let options: Option<stadiacast::Options> = if let Some(executable) = option("--stadiacast") {
         let options = stadiacast::Options {
@@ -209,25 +330,67 @@ async fn main() -> Result<()> {
         identity,
         path,
         invitation,
+        short_pairing,
+        pairing: None,
         active: None,
-        name,
+        name: name.clone(),
         device: device.clone(),
     }));
     let admission = Arc::new(Mutex::new(()));
     let mut tasks = tokio::task::JoinSet::new();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    if let Some(port) = port.filter(|_| short_pairing) {
+        println!(
+            "Bridge ready: {name}\nPort: {port}\nRun wave-bridge pair to generate a pairing code."
+        );
+    } else if let Some(port) = port {
+        println!(
+            "Bridge ready: {name}\nPort: {port}\nCertificate SHA-256: {fingerprint}\nPairing invitation (valid 10 minutes, one use): {}",
+            data.join("pairing.json").display()
+        );
+    } else {
+        println!("Bridge ready: {name} (local socket)");
+    }
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = terminate.recv() => break,
-            incoming = listener.accept() => {
+            incoming = async { match &listener { Some(listener) => listener.accept().await, None => std::future::pending().await } } => {
                 let (stream, peer) = incoming?;
                 let acceptor = acceptor.clone();
                 let state = state.clone();
                 let admission = admission.clone();
                 tasks.spawn(async move {
-                    if let Err(error) = handle(stream, acceptor, state, admission).await {
+                    if let Err(error) = handle(stream, acceptor, state, admission, short_pairing).await {
                         eprintln!("Connection {peer}: {error:#}");
+                    }
+                });
+            }
+            incoming = async {
+                match &local {
+                    Some((listener, _, uid)) => listener.accept().await.map(|(stream, _)| (stream, *uid)),
+                    None => std::future::pending().await,
+                }
+            } => {
+                let (stream, local_uid) = incoming?;
+                if !stream.peer_cred().is_ok_and(|cred| cred.uid() == local_uid) {
+                    continue;
+                }
+                let state = state.clone();
+                let admission = admission.clone();
+                tasks.spawn(async move {
+                    let result = async {
+                        let socket = match tokio::time::timeout(Duration::from_secs(10), accept_async(stream)).await? {
+                            Ok(socket) => socket,
+                            Err(tokio_tungstenite::tungstenite::Error::Protocol(
+                                tokio_tungstenite::tungstenite::error::ProtocolError::HandshakeIncomplete
+                            )) => return Ok(()),
+                            Err(error) => return Err(error.into()),
+                        };
+                        authenticate(socket, true, state, admission).await
+                    }.await;
+                    if let Err(error) = result {
+                        eprintln!("Local connection: {error:#}");
                     }
                 });
             }
@@ -238,17 +401,20 @@ async fn main() -> Result<()> {
         active.task.abort();
     }
     device.shutdown().await;
-    daemon.unregister(&fullname)?;
-    daemon.shutdown()?;
+    if let Some((daemon, fullname)) = advertisement {
+        daemon.unregister(&fullname)?;
+        daemon.shutdown()?;
+    }
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     Ok(())
 }
 
-type Socket =
-    tokio_tungstenite::WebSocketStream<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>;
+trait Transport: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> Transport for T {}
+type Socket<T> = tokio_tungstenite::WebSocketStream<T>;
 
-async fn send(socket: &mut Socket, message: ServerMessage) -> Result<()> {
+async fn send<T: Transport>(socket: &mut Socket<T>, message: ServerMessage) -> Result<()> {
     tokio::time::timeout(
         Duration::from_secs(2),
         socket.send(Message::Text(serde_json::to_string(&message)?.into())),
@@ -262,20 +428,105 @@ async fn handle(
     acceptor: TlsAcceptor,
     state: Arc<Mutex<State>>,
     admission: Arc<Mutex<()>>,
+    short_pairing: bool,
 ) -> Result<()> {
-    let mut socket = tokio::time::timeout(Duration::from_secs(10), async {
+    let mut first = [0u8; 1];
+    if short_pairing
+        && tokio::time::timeout(Duration::from_secs(5), stream.peek(&mut first)).await?? == 1
+        && first[0] == b'G'
+    {
+        return tokio::time::timeout(Duration::from_secs(5), pairing_bootstrap(stream, state))
+            .await?;
+    }
+    let socket = tokio::time::timeout(Duration::from_secs(10), async {
         let stream = acceptor.accept(stream).await?;
         anyhow::Ok(accept_async(stream).await?)
     })
     .await??;
+    authenticate(socket, false, state, admission).await
+}
+
+async fn pairing_bootstrap(stream: tokio::net::TcpStream, state: Arc<Mutex<State>>) -> Result<()> {
+    use wave_protocol::pairing::{self, Ed25519Group, Password, Spake2};
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(4096))
+        .max_frame_size(Some(4096));
+    let mut socket = tokio_tungstenite::accept_async_with_config(stream, Some(config)).await?;
+    let request = socket.next().await.context("Missing pairing request")??;
+    let ClientMessage::PairingHello { message } = serde_json::from_str(request.to_text()?)? else {
+        bail!("Pairing bootstrap required");
+    };
+    let response = {
+        let mut guard = state.lock().await;
+        let id = guard.identity.id.clone();
+        let certificate_pem = guard.identity.certificate_pem.clone();
+        let window = guard
+            .pairing
+            .as_mut()
+            .filter(|window| window.valid() && window.attempts > 0)
+            .context("Pairing window unavailable")?;
+        window.attempts -= 1;
+        let (a, b) = pairing::identities();
+        let (exchange, outbound) =
+            Spake2::<Ed25519Group>::start_b(&Password::new(window.code.as_bytes()), &a, &b);
+        let secret = exchange
+            .finish(&message)
+            .map_err(|_| anyhow::anyhow!("Invalid pairing message"))?;
+        let key = pairing::key(&secret);
+        window
+            .grants
+            .push(pairing::grant(&key, &id, &certificate_pem));
+        let proof = ring::hmac::sign(
+            &key,
+            &pairing::transcript("server-proof", &id, &certificate_pem),
+        );
+        pairing::Challenge {
+            id,
+            certificate_pem,
+            message: outbound,
+            proof: proof.as_ref().to_vec(),
+        }
+    };
+    socket
+        .send(Message::Text(serde_json::to_string(&response)?.into()))
+        .await?;
+    Ok(())
+}
+
+async fn authenticate<T: Transport>(
+    mut socket: Socket<T>,
+    local: bool,
+    state: Arc<Mutex<State>>,
+    admission: Arc<Mutex<()>>,
+) -> Result<()> {
     let first = tokio::time::timeout(Duration::from_secs(10), socket.next())
         .await?
         .context("Missing authentication")??;
     let auth: ClientMessage = serde_json::from_str(first.to_text()?)?;
+    if local && matches!(auth, ClientMessage::IssuePairingCode) {
+        let response = {
+            let mut guard = state.lock().await;
+            if guard.short_pairing {
+                let window = PairingWindow::new()?;
+                let code = window.code.clone();
+                guard.pairing = Some(window);
+                ServerMessage::PairingCode { code }
+            } else {
+                ServerMessage::Error {
+                    message: "Start Bridge with --remote to issue a code".into(),
+                }
+            }
+        };
+        return send(&mut socket, response).await;
+    }
     let _admission = admission.lock().await;
     let mut guard = state.lock().await;
     let result: Result<(bool, Option<String>)> = (|| {
         match auth {
+            ClientMessage::LocalConnect { version, takeover } if local && version == VERSION => {
+                Ok((takeover, None))
+            }
+            _ if local => bail!("Local connection required"),
             ClientMessage::Pair {
                 version,
                 companion_id,
@@ -286,7 +537,13 @@ async fn handle(
                 if version != VERSION {
                     bail!("Incompatible protocol version");
                 }
-                if unix_seconds() >= guard.invitation.expires_at
+                if guard.short_pairing {
+                    if !guard.pairing.as_ref().is_some_and(|window| {
+                        window.valid() && window.grants.iter().any(|grant| grant == &token)
+                    }) {
+                        bail!("Pairing code invalid, expired or already used");
+                    }
+                } else if unix_seconds() >= guard.invitation.expires_at
                     || token != guard.invitation.pairing_token
                 {
                     bail!("Pairing invitation expired or already used");
@@ -299,11 +556,19 @@ async fn handle(
                     return Ok((false, None));
                 }
                 let secret = Uuid::new_v4().to_string();
-                guard
-                    .identity
+                let mut updated = guard.identity.clone();
+                if guard.short_pairing {
+                    updated.companions.clear();
+                }
+                updated
                     .companions
                     .insert(companion_id, hex::encode(Sha256::digest(secret.as_bytes())));
-                private_write(&guard.path, &serde_json::to_vec_pretty(&guard.identity)?)?;
+                private_write(&guard.path, &serde_json::to_vec_pretty(&updated)?)?;
+                guard.identity = updated;
+                if guard.short_pairing {
+                    guard.pairing = None;
+                    return Ok((takeover, Some(secret)));
+                }
                 let next = Invitation {
                     bridge_id: guard.identity.id.clone(),
                     certificate_pem: guard.identity.certificate_pem.clone(),
@@ -406,8 +671,8 @@ async fn handle(
     Ok(())
 }
 
-async fn serve(
-    socket: &mut Socket,
+async fn serve<T: Transport>(
+    socket: &mut Socket<T>,
     mut cancelled: oneshot::Receiver<()>,
     state: &Arc<Mutex<State>>,
     id: &str,

@@ -18,7 +18,7 @@ cargo run -p wave-bridge
 ./scripts/run-companion.sh
 ```
 
-Bridge 默认监听 TCP 8787 并发布 `_stadia-wave._tcp.local.`。如 macOS 提示局域网访问，允许这两个程序使用局域网。在 Companion 中选中发现的 Bridge，将 Bridge 终端显示的 `pairing.json` 绝对路径粘贴进配对文件输入框，点击「连接」。
+Bridge 默认使用当前用户专用的 Unix Socket。在 Companion 的「概览 → Wave Bridge」选择「本机」并连接，无需配对文件或钥匙串。远程连接使用 `wave-bridge --remote` 启用 TCP 8787 和 Bonjour，在 Bridge 主机执行 `wave-bridge pair` 后将八位码填入概览页。单独传入 `--port` 可继续使用旧 `pairing.json` 流程。详情见[Bridge 发现与配对](docs/bridge-pairing.md)。
 
 配对文件有效期为十分钟且只可使用一次。配对成功后，长期凭据保存在 macOS Keychain。点击「断开」后再次「连接」即可用已保存的凭据重连。每次配对成功后，Bridge 自动更新同一路径的邀请，可继续配对另一个 Companion。Bridge 重启保留身份和配对记录，同时生成新的短时邀请。
 

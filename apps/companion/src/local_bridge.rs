@@ -27,14 +27,7 @@ pub fn status() -> String {
 pub fn start() -> Result<()> {
     let mut child = process().lock().unwrap();
     ensure!(child.is_none(), "本机 Bridge 已启动");
-    ensure!(
-        std::net::TcpStream::connect_timeout(
-            &"127.0.0.1:8787".parse().unwrap(),
-            std::time::Duration::from_millis(200)
-        )
-        .is_err(),
-        "端口 8787 已有服务，请连接已有 Bridge"
-    );
+    ensure!(!available(), "已有本机 Bridge 在运行");
     let current = std::env::current_exe()?;
     let bin_dir = current.parent().context("无法定位 Companion 安装目录")?;
     let bundled = bin_dir
@@ -88,4 +81,26 @@ pub fn stop() -> Result<()> {
         child.wait().context("等待本机 Bridge 退出失败")?;
     }
     Ok(())
+}
+
+pub fn socket_path() -> std::path::PathBuf {
+    directories::ProjectDirs::from("dev", "stadiawave", "bridge")
+        .unwrap()
+        .data_dir()
+        .join("bridge.sock")
+}
+
+pub fn available() -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let path = socket_path();
+    let Some(directory) = path
+        .parent()
+        .and_then(|path| std::fs::symlink_metadata(path).ok())
+    else {
+        return false;
+    };
+    directory.is_dir()
+        && directory.uid() == unsafe { libc::geteuid() }
+        && directory.permissions().mode() & 0o077 == 0
+        && std::os::unix::net::UnixStream::connect(path).is_ok()
 }

@@ -20,7 +20,7 @@ crates/protocol/   消息类型、版本、录音与请求标识
 手柄 ── Wi‑Fi ── Stadiacast
                      │ 本机事件 API、结构化日志、Ogg Opus
                      ▼
-                  Wave Bridge ←── WSS ── Wave Companion
+                  Wave Bridge ←── Unix Socket / WSS ── Wave Companion
                      │                         ▲
                      └────── DNS-SD 发布 ──────┘
 ```
@@ -28,12 +28,12 @@ crates/protocol/   消息类型、版本、录音与请求标识
 | 链路 | 建立方式 |
 | --- | --- |
 | 手柄 → Stadiacast | 路由器按手柄的 Wi‑Fi MAC 下发 DHCP Option 6，指向 Bridge 主机的固定 LAN IP。Stadiacast 在同一台主机提供手柄使用的 DNS 和接收服务。 |
-| Companion → Bridge | Bridge 在 LAN 发布 `_stadia-wave._tcp.local.`。Companion 浏览服务、解析主机与端口，再通过发现到的地址建立 WSS。两者同机时也使用这套流程。 |
+| Companion → Bridge | 本机默认通过同一系统用户的 Unix Socket 连接。启用远程访问后，Bridge 发布 `_stadia-wave._tcp.local.`，Companion 发现地址后建立 WSS。 |
 | Bridge → Stadiacast | Bridge 在本机通过回环地址访问 Stadiacast，读取状态、调用控制接口，并读取本次运行目录中的日志与录音。 |
 
 DNS-SD 实例名用于显示设备名称，TXT 字段公布协议主版本。Companion 手动输入 Bridge 地址时复用同一套连接与认证逻辑。mDNS 发现依赖本地链路，发布和浏览权限按 macOS 局域网规则处理。 [DNS-SD](https://www.rfc-editor.org/rfc/rfc6763.html) · [macOS 局域网权限](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)
 
-Bridge 持久保存自己的身份密钥。首次配对通过本机 CLI 提供短时有效的一次性凭据和证书指纹，Companion 从该可信渠道取得指纹，验证 WSS 服务端后再交换配对凭据。每个 Companion 保存自己的长期凭据，macOS 上使用 Keychain。重连验证的是配对身份，地址和发现记录用于定位。局域网客户端使用 Bridge 的认证接口。Stadiacast 自带的 HTTP 控制端口需要按实际监听范围限制访问，尤其是部署在多人共用的 LAN 时。 [WebSocket 协议](https://www.rfc-editor.org/rfc/rfc6455.html) · [Stadiacast 监听端口](https://github.com/jkfran/stadiacast/blob/v1.3.0/docs/setup.md#network)
+Bridge 持久保存自己的 TLS 身份。远程首次配对时，用户在 Bridge 主机执行 `wave-bridge pair`，Companion 用短码和 SPAKE2 验证服务端证书，再通过 WSS 接收长期凭据并保存到 macOS 钥匙串。远程重连用保存的 TLS 证书验证对端，地址和发现记录用于定位。本机直连由操作系统验证对端用户身份。局域网客户端使用 Bridge 的认证接口。Stadiacast 自带的 HTTP 控制端口需要按实际监听范围限制访问，尤其是部署在多人共用的 LAN 时。 [WebSocket 协议](https://www.rfc-editor.org/rfc/rfc6455.html) · [Stadiacast 监听端口](https://github.com/jkfran/stadiacast/blob/v1.3.0/docs/setup.md#network)
 
 ## Bridge 运行和数据来源
 
@@ -89,7 +89,7 @@ Companion 网络层将已完成的录音交给 ASR 适配层。各引擎接收�
 
 2026 年 11 月 20 日，已建立 workspace，并在当前 Mac 上完成真实 mDNS 发现、WSS 配对与连接、双向心跳，以及读取 Keychain 凭据重新连接。Companion 的 NSH 窗口已验证发现列表选择、连接、断开和再次连接。
 
-首次配对使用 Bridge 生成的 pairing.json。文件包含服务端证书和一次性令牌，由当前用户的本机文件路径提供信任来源，有效期十分钟且仅使用一次。Bridge 重启保留身份和长期配对记录，同时刷新邀请。用户选取发现到的 Bridge 后，Companion 校验配对文件里的 Bridge 身份，用文件中的证书建立 TLS 信任，再保存长期凭据。连接状态和每五秒一次的心跳显示在窗口里。
+旧版远程流程首次配对使用 Bridge 生成的 pairing.json。文件包含服务端证书和一次性令牌，由当前用户的本机文件路径提供信任来源，有效期十分钟且仅使用一次。Bridge 重启保留身份和长期配对记录，同时刷新邀请。用户选取发现到的 Bridge 后，Companion 校验配对文件里的 Bridge 身份，用文件中的证书建立 TLS 信任，再保存长期凭据。连接状态和每五秒一次的心跳显示在窗口里。
 
 第二阶段已实现单连接接管、自动重连和旧会话失效处理。手动输入网络地址和 ASR 按各自阶段接入。当前 macOS 开发版本通过 scripts/run-companion.sh 构建并打开本地应用。
 
@@ -97,7 +97,7 @@ Companion 网络层将已完成的录音交给 ASR 适配层。各引擎接收�
 
 协议主版本为 2。认证消息包含显式接管标记。Bridge 串行处理通过认证的连接请求，先撤销旧会话的归属并请求关闭，再启用新会话。旧端收到 Replaced 后停止自动重连。自动重连发送不接管请求，Bridge 返回 Busy 时暂停重连并提示用户点击连接接管。心跳携带会话 ID，Bridge 验证当前归属后响应。旧任务只清理属于自身的活动槽位。
 
-Companion 将网络会话作为独立任务管理。用户断开或切换目标时取消并等待旧任务退出，随后再处理新会话。网络异常使用 1、2、4、8 秒上限的退避重试，重试时按 Bridge 身份刷新发现地址。认证拒绝和 Keychain 失败由界面报告。首次配对成功后 Bridge 自动刷新同一文件的短时邀请，使第二个 Companion 可以独立配对。
+Companion 将网络会话作为独立任务管理。用户断开或切换目标时取消并等待旧任务退出，随后再处理新会话。网络异常使用 1、2、4、8 秒上限的退避重试，重试时按 Bridge 身份刷新发现地址。认证拒绝和 Keychain 失败由界面报告。旧版远程流程首次配对成功后 Bridge 自动刷新同一文件的短时邀请，使第二个 Companion 可以独立配对。
 
 已通过真实 mDNS 和 WSS 的双客户端回归，覆盖接管、旧端停止重连、错误凭据无权接管、自动请求遇占用、Bridge 重启恢复、旧会话 ID 拒绝和新会话继续响应。当前消息只涉及连接和心跳。手柄接入后的录音取消和旧震动指令隔离将在接入相应功能时验证。
 
@@ -140,3 +140,5 @@ Stadiacast 异常退出会取消未完成录音，清理旧进程的音频状态
 ## 行为运行时阶段
 
 规则、脚本、作用域资源、事件消费与热替换的设计见[行为运行时](behavior-runtime.md)。本阶段先用手写示例验证，再接入 Rig 助手。
+
+新的本机直连与远程配对流程见[Bridge 发现与配对](bridge-pairing.md)。

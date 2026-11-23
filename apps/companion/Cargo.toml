@@ -6,6 +6,8 @@ license.workspace = true
 default-run = "wave-companion"
 
 [dependencies]
+libc = "0.2"
+ring = "0.17"
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
