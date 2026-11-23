@@ -124,7 +124,7 @@ WAVE_SIGN_IDENTITY="Developer ID Application: YOUR NAME (TEAMID)" \
 
 用 `xcrun notarytool store-credentials stadia-wave` 将公证凭证存入钥匙串。CI 也可用密钥管理器注入 `APPLE_ID`、`APPLE_PASSWORD`（App 专用密码）和 `APPLE_TEAM_ID`，或注入 `APPLE_API_KEY`（Key ID）、`APPLE_API_KEY_PATH`（.p8 文件路径）和 `APPLE_API_ISSUER`。公证提交的是 App ZIP。
 
-需要在 App 中携带 Stadiacast 时，设置 `WAVE_STADIACAST_BINARY` 为已签名的 macOS 二进制路径，并设置 `WAVE_STADIACAST_LICENSE_DIR` 为包含该版本 `LICENSE` 和 `NOTICE` 的目录。公证模式还要求将二进制内捆绑的 Python 和其他依赖的许可及版权声明放在该目录的 `THIRD-PARTY-LICENSES` 子目录。Bridge 会沿用已保存的手柄 IP、通告 IP 和 DNS 配置。首次部署仍需按前面的说明完成网络配置。
+打包默认从项目根目录的 `stadiacast-1.3.0-macos-arm64/` 读取 `stadiacast`、`stadiacast-provision`、`LICENSE` 和 `NOTICE`。两个工具都放在 App 的 `Contents/Helpers/`。可用 `WAVE_STADIACAST_BINARY`、`WAVE_STADIACAST_PROVISION_BINARY` 和 `WAVE_STADIACAST_LICENSE_DIR` 指定其他已签名构建及对应许可目录。独立输出的 `wave-bridge` 需要单独配置运行时。公证模式还要求将二进制内捆绑的 Python 和其他依赖的许可及版权声明放在该目录的 `THIRD-PARTY-LICENSES` 子目录。Bridge 会沿用已保存的手柄 IP、通告 IP 和 DNS 配置。首次部署仍需按前面的说明完成网络配置。
 
 Stadiacast 上游的 MIT 许可对三份源自 Google 固件的 protobuf 定义有例外。公开分发前，请一并核对上游 NOTICE 和所选二进制全部组件的分发条款。公证模式保留 Stadiacast 原有签名，要求它在构建时以 Developer ID 签署 PyInstaller 包内的原生组件。
 

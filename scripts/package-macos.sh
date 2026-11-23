@@ -8,8 +8,10 @@ project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_dir"
 identity=${WAVE_SIGN_IDENTITY:-${APPLE_SIGNING_IDENTITY:--}}
 notarize=${WAVE_NOTARIZE:-0}
-stadiacast=${WAVE_STADIACAST_BINARY:-}
-stadiacast_licenses=${WAVE_STADIACAST_LICENSE_DIR:-}
+stadiacast_dir="$project_dir/stadiacast-1.3.0-macos-arm64"
+stadiacast=${WAVE_STADIACAST_BINARY:-"$stadiacast_dir/stadiacast"}
+stadiacast_provision=${WAVE_STADIACAST_PROVISION_BINARY:-"$stadiacast_dir/stadiacast-provision"}
+stadiacast_licenses=${WAVE_STADIACAST_LICENSE_DIR:-"$stadiacast_dir"}
 destination=${WAVE_PACKAGE_OUTPUT:-"$project_dir/target/macos"}
 
 [ "$(uname -s)" = Darwin ] || die 'This script requires macOS.'
@@ -43,23 +45,31 @@ if [ "$notarize" = 1 ]; then
     fi
 fi
 
-if [ -n "$stadiacast" ]; then
-    [ -f "$stadiacast" ] && [ -x "$stadiacast" ] || die 'WAVE_STADIACAST_BINARY must be an executable file.'
-    [ -n "$stadiacast_licenses" ] && [ -f "$stadiacast_licenses/LICENSE" ] &&
-        [ -f "$stadiacast_licenses/NOTICE" ] || die 'WAVE_STADIACAST_LICENSE_DIR must contain LICENSE and NOTICE.'
+rust_target=$(rustc -vV | awk '/^host:/ { print $2 }')
+case "$rust_target" in
+    aarch64-apple-darwin) mac_arch=arm64 ;;
+    x86_64-apple-darwin) mac_arch=x86_64 ;;
+    *) die "Unsupported macOS build target: $rust_target" ;;
+esac
+[ -f "$stadiacast_licenses/LICENSE" ] && [ -f "$stadiacast_licenses/NOTICE" ] ||
+    die "Missing LICENSE or NOTICE in $stadiacast_licenses."
+if [ "$notarize" = 1 ]; then
+    [ -d "$stadiacast_licenses/THIRD-PARTY-LICENSES" ] ||
+        die 'Include the notices for dependencies bundled inside Stadiacast in THIRD-PARTY-LICENSES.'
+fi
+
+for binary in "$stadiacast" "$stadiacast_provision"; do
+    [ -f "$binary" ] && [ -x "$binary" ] || die "Missing executable: $binary"
+    lipo -verify_arch "$mac_arch" "$binary" || die "Expected $mac_arch binary: $binary"
+    codesign --verify --strict "$binary"
     if [ "$notarize" = 1 ]; then
-        [ -d "$stadiacast_licenses/THIRD-PARTY-LICENSES" ] ||
-            die 'Include the notices for dependencies bundled inside Stadiacast in THIRD-PARTY-LICENSES.'
-        codesign --verify --strict "$stadiacast"
-        signature=$(codesign --display --verbose=4 "$stadiacast" 2>&1)
+        signature=$(codesign --display --verbose=4 "$binary" 2>&1)
         printf '%s\n' "$signature" | grep -q '^Authority=Developer ID Application:' &&
             printf '%s\n' "$signature" | grep -Eq '^CodeDirectory .*flags=.*\(runtime([,)]|$)' &&
             printf '%s\n' "$signature" | grep -q '^Timestamp=' ||
-            die 'Use a Stadiacast build already signed with Developer ID, hardened runtime and a secure timestamp.'
+            die "Use a Developer ID signed build with hardened runtime and a secure timestamp: $binary"
     fi
-elif [ -n "$stadiacast_licenses" ]; then
-    die 'Set WAVE_STADIACAST_BINARY to include Stadiacast with its notices.'
-fi
+done
 
 sign() {
     if [ "$notarize" = 1 ]; then
@@ -70,7 +80,6 @@ sign() {
 }
 
 target_dir="$project_dir/target"
-rust_target=$(rustc -vV | awk '/^host:/ { print $2 }')
 env -u CARGO_BUILD_TARGET cargo build --release --locked --target-dir "$target_dir" -p wave-bridge -p wave-companion
 
 mkdir -p "$destination"
@@ -106,15 +115,15 @@ cargo metadata --locked --format-version 1 --filter-platform "$rust_target" > "$
 version=$(python3 scripts/collect-macos-licenses.py "$licenses" < "$stage/cargo-metadata.json")
 plutil -replace CFBundleShortVersionString -string "$version" "$contents/Info.plist"
 
-if [ -n "$stadiacast" ]; then
-    install -m 755 "$stadiacast" "$contents/Helpers/stadiacast"
-    mkdir "$licenses/Stadiacast"
-    cp "$stadiacast_licenses/LICENSE" "$stadiacast_licenses/NOTICE" "$licenses/Stadiacast/"
-    if [ -d "$stadiacast_licenses/THIRD-PARTY-LICENSES" ]; then
-        ditto "$stadiacast_licenses/THIRD-PARTY-LICENSES" "$licenses/Stadiacast/THIRD-PARTY-LICENSES"
-    fi
-    codesign --verify --strict "$contents/Helpers/stadiacast"
+install -m 755 "$stadiacast" "$contents/Helpers/stadiacast"
+install -m 755 "$stadiacast_provision" "$contents/Helpers/stadiacast-provision"
+mkdir "$licenses/Stadiacast"
+cp "$stadiacast_licenses/LICENSE" "$stadiacast_licenses/NOTICE" "$licenses/Stadiacast/"
+if [ -d "$stadiacast_licenses/THIRD-PARTY-LICENSES" ]; then
+    ditto "$stadiacast_licenses/THIRD-PARTY-LICENSES" "$licenses/Stadiacast/THIRD-PARTY-LICENSES"
 fi
+codesign --verify --strict "$contents/Helpers/stadiacast"
+codesign --verify --strict "$contents/Helpers/stadiacast-provision"
 sign --identifier dev.stadiawave.bridge "$contents/Helpers/wave-bridge"
 sign "$bundle"
 codesign --verify --deep --strict "$bundle"
