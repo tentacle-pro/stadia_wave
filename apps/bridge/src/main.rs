@@ -154,6 +154,31 @@ fn bundled_stadiacast() -> Option<PathBuf> {
     runtime.is_file().then_some(runtime)
 }
 
+/// The default gateway and this machine's address on the interface that routes to
+/// it. A packaged app uses these when it has no saved Stadiacast configuration yet,
+/// so the bundled Stadiacast starts without any setup.
+fn lan_defaults() -> Option<(String, String)> {
+    let route = std::process::Command::new("/sbin/route")
+        .args(["-n", "get", "default"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&route.stdout);
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.trim().strip_prefix(name))
+            .map(|value| value.trim().to_string())
+    };
+    let gateway = field("gateway:")?;
+    let interface = field("interface:")?;
+    let address = std::process::Command::new("/usr/sbin/ipconfig")
+        .args(["getifaddr", &interface])
+        .output()
+        .ok()?;
+    let address = String::from_utf8_lossy(&address.stdout).trim().to_string();
+    let ipv4 = |value: &str| value.parse::<Ipv4Addr>().is_ok();
+    (ipv4(&gateway) && ipv4(&address)).then_some((gateway, address))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
@@ -301,15 +326,15 @@ async fn main() -> Result<()> {
             executable: PathBuf::from(executable)
                 .canonicalize()
                 .context("Stadiacast executable not found")?,
-            controller_ip: option("--controller-ip").context("--controller-ip required")?,
+            controller_ip: Some(option("--controller-ip").context("--controller-ip required")?),
             advertise_ip: option("--advertise-ip").context("--advertise-ip required")?,
             dns_upstream: option("--dns-upstream").context("--dns-upstream required")?,
         };
-        for address in [
-            &options.controller_ip,
-            &options.advertise_ip,
-            &options.dns_upstream,
-        ] {
+        for address in options
+            .controller_ip
+            .iter()
+            .chain([&options.advertise_ip, &options.dns_upstream])
+        {
             address
                 .parse::<Ipv4Addr>()
                 .context("Expected an IPv4 address")?;
@@ -322,6 +347,16 @@ async fn main() -> Result<()> {
             options.executable = runtime;
         }
         Some(options)
+    } else if let Some(runtime) = bundled_stadiacast() {
+        lan_defaults().map(|(gateway, address)| {
+            eprintln!("Stadiacast 未配置，使用局域网默认值：DNS {gateway}，本机地址 {address}");
+            stadiacast::Options {
+                executable: runtime,
+                controller_ip: None,
+                advertise_ip: address,
+                dns_upstream: gateway,
+            }
+        })
     } else {
         None
     };

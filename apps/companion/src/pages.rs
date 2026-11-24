@@ -79,10 +79,14 @@ fn link(label: &'static str, url: &'static str) -> impl IntoElement {
         .child(text(format!("{label} ↗")).text_color(rgb(MINT)))
 }
 
+// The modern extension host ignores `?privacy-…` as an anchor; the legacy host
+// forwards to the same pane and keeps the anchor, which the system resolves.
 const ACCESSIBILITY_SETTINGS: &str =
-    "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?privacy-accessibility";
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+// The documented anchor. This macOS build ignores it for Local Network (the pane
+// has no reveal key), so the row also says which entry to click.
 const LOCAL_NETWORK_SETTINGS: &str =
-    "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?privacy-localnetwork";
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork";
 const LOGIN_ITEMS_SETTINGS: &str =
     "x-apple.systempreferences:com.apple.LoginItems-Settings.extension";
 
@@ -102,23 +106,32 @@ fn permission_row(
     label: &'static str,
     status: impl Fn() -> String + 'static,
     settings: &'static str,
+    hint: &'static str,
 ) -> impl IntoElement {
     view()
-        .flex_row()
-        .items_center()
-        .gap_2()
+        .gap_1()
         .py_1()
-        .child(text(label).w(px(72.0)).flex_none().text_color(rgb(MUTED)))
-        .child(text(status).flex_1().text_size(px(12.0)))
+        .child(text(label).text_size(px(12.0)).text_color(rgb(MUTED)))
         .child(
-            button()
-                .on_press(move || {
-                    spawn(async move {
-                        let _ = open_url(settings).await;
-                    });
-                })
-                .child(control().child(text("打开"))),
+            view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(text(status).flex_1().text_size(px(13.0)))
+                .child(
+                    button()
+                        .on_press(move || {
+                            spawn(async move {
+                                let _ = open_url(settings).await;
+                            });
+                        })
+                        .child(control().child(text("打开"))),
+                ),
         )
+        .child(when(
+            move || !hint.is_empty(),
+            move || text(hint).text_size(px(11.0)).text_color(rgb(MUTED)),
+        ))
 }
 
 pub fn about(mark: ImageSrc, update_notice: Signal<String>) -> impl IntoElement {
@@ -592,7 +605,7 @@ pub fn overview(
                                         .gap_2()
                                         .child(heading("系统权限", 16.0))
                                         .child(permission_row(
-                                            "辅助功能",
+                                            "设备控制和数据访问",
                                             move || {
                                                 if authorized.get() {
                                                     "已授权".into()
@@ -601,6 +614,7 @@ pub fn overview(
                                                 }
                                             },
                                             ACCESSIBILITY_SETTINGS,
+                                            "",
                                         ))
                                         .child(permission_row(
                                             "本地网络",
@@ -612,6 +626,7 @@ pub fn overview(
                                                 }
                                             },
                                             LOCAL_NETWORK_SETTINGS,
+                                            "打开后在「隐私与安全性」列表里选「本地网络」",
                                         ))
                                         .child(when(
                                             move || driver.get().is_some(),
@@ -629,6 +644,7 @@ pub fn overview(
                                                         }
                                                     },
                                                     LOGIN_ITEMS_SETTINGS,
+                                                    "",
                                                 )
                                             },
                                         ))
@@ -845,68 +861,231 @@ pub(crate) fn bridge_connections(
 }
 
 pub(crate) fn asr_settings(
+    provider: Signal<String>,
     endpoint: Signal<String>,
+    api_key: Signal<String>,
     language: Signal<String>,
     dictation: Dictation,
 ) -> impl IntoElement {
+    let picker = dictation.clone();
     let change_endpoint = dictation.clone();
+    let detect = dictation.clone();
+    let key_dictation = dictation.clone();
+    let language_dictation = dictation.clone();
+    let notice = signal(String::new());
+    let key_notice = signal(String::new());
     view()
         .gap_3()
-        .child(heading("ASR 服务", 22.0))
         .child(
             view()
-                .gap_2()
-                .child(text("本机服务地址").font_weight(FontWeight::SEMIBOLD))
+                .gap_1()
+                .child(heading("ASR 服务", 22.0))
                 .child(
-                    input()
-                        .value(move || endpoint.get())
-                        .placeholder("http://127.0.0.1:58078")
-                        .on_change(move |value: &str| {
-                            endpoint.set(value.to_owned());
-                            change_endpoint.endpoint(value.to_owned());
-                            if asr::local_endpoint(value).is_ok() {
-                                let _ = Storage::set_item("asr.endpoint", value.trim());
-                            }
-                        })
-                        .h(px(38.0))
-                        .p_2()
-                        .rounded_md()
-                        .border(px(1.0))
-                        .border_color(rgb(RULE)),
-                )
-                .child(
-                    text("Voxt 重启后端口可能变化。")
-                        .text_size(px(13.0))
+                    text(move || asr::provider_by_id(&provider.get()).summary.to_string())
+                        .text_size(px(12.0))
                         .text_color(rgb(MUTED)),
                 ),
         )
+        .child(dynamic(move || {
+            asr::PROVIDERS
+                .iter()
+                .map(|item| {
+                    let selected = provider.get() == item.id;
+                    let dictation = picker.clone();
+                    button()
+                        .on_press(move || {
+                            provider.set(item.id.into());
+                            let _ = Storage::set_item("asr.provider", item.id);
+                            dictation.provider(item.id.into());
+                            if asr::validate(item.id, &endpoint.get()).is_err() {
+                                endpoint.set(String::new());
+                                dictation.endpoint(String::new());
+                                let _ = Storage::set_item("asr.endpoint", "");
+                            }
+                            let key = if item.secret {
+                                asr::stored_api_key(item.id).unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
+                            api_key.set(key.clone());
+                            dictation.api_key(key);
+                            notice.set(String::new());
+                            key_notice.set(String::new());
+                        })
+                        .child(
+                            control()
+                                .bg(if selected { rgb(0xeaf2ef) } else { rgb(SURFACE) })
+                                .child(
+                                    text(item.label)
+                                        .text_color(if selected { rgb(MINT) } else { rgb(INK) }),
+                                ),
+                        )
+                })
+                .collect::<Vec<_>>()
+        }))
         .child(
             view()
                 .gap_2()
-                .pt_2()
-                .child(text("识别语言").font_weight(FontWeight::SEMIBOLD))
                 .child(
-                    input()
-                        .value(move || language.get())
-                        .placeholder("留空自动识别")
-                        .on_change(move |value: &str| {
-                            language.set(value.to_owned());
-                            dictation.language(value.to_owned());
-                            let _ = Storage::set_item("asr.language", value.trim());
-                        })
-                        .w(px(180.0))
-                        .h(px(38.0))
-                        .p_2()
-                        .rounded_md()
-                        .border(px(1.0))
-                        .border_color(rgb(RULE)),
+                    text(move || asr::provider_by_id(&provider.get()).address_label.to_string())
+                        .font_weight(FontWeight::SEMIBOLD),
+                )
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            input()
+                                .value(move || endpoint.get())
+                                .placeholder(move || {
+                                    asr::provider_by_id(&provider.get())
+                                        .address_placeholder
+                                        .to_string()
+                                })
+                                .on_change(move |value: &str| {
+                                    endpoint.set(value.to_owned());
+                                    change_endpoint.endpoint(value.to_owned());
+                                    if asr::validate(&provider.get(), value).is_ok() {
+                                        let _ = Storage::set_item("asr.endpoint", value.trim());
+                                    }
+                                })
+                                .flex_1()
+                                .h(px(38.0))
+                                .p_2()
+                                .rounded_md()
+                                .border(px(1.0))
+                                .border_color(rgb(RULE)),
+                        )
+                        .child(when(
+                            move || asr::provider_by_id(&provider.get()).discovery,
+                            move || {
+                                let detect = detect.clone();
+                                button()
+                                    .on_press(move || {
+                                        match asr::connector_for(&provider.get()).discover() {
+                                            Some(found) => {
+                                                endpoint.set(found.clone());
+                                                detect.endpoint(found.clone());
+                                                let _ = Storage::set_item("asr.endpoint", &found);
+                                                notice.set(format!("已找到 {found}"));
+                                            }
+                                            None => {
+                                                notice.set("未找到运行中的 qwen3_asr_server".into())
+                                            }
+                                        }
+                                    })
+                                    .child(control().child(text("检测")))
+                            },
+                        )),
+                )
+                .child(when(
+                    move || !notice.get().is_empty(),
+                    move || {
+                        text(move || notice.get())
+                            .text_size(px(13.0))
+                            .text_color(rgb(MINT))
+                    },
+                ))
+                .child(
+                    text(move || {
+                        if asr::provider_by_id(&provider.get()).discovery {
+                            "端口由本机服务动态分配；点「检测」读取当前监听端口，或用 WAVE_ASR_URL 覆盖。"
+                                .to_string()
+                        } else {
+                            "地址填到 API 根（含 /v1 也可以）；密钥保存在钥匙串。".to_string()
+                        }
+                    })
+                    .text_size(px(13.0))
+                    .text_color(rgb(MUTED)),
                 ),
         )
+        .child(when(
+            move || asr::provider_by_id(&provider.get()).secret,
+            move || {
+                let dictation = key_dictation.clone();
+                view()
+                    .gap_2()
+                    .pt_2()
+                    .child(text("API key").font_weight(FontWeight::SEMIBOLD))
+                    .child(
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                input()
+                                    .value(move || api_key.get())
+                                    .placeholder("sk-…")
+                                    .masked(true)
+                                    .on_change(move |value: &str| {
+                                        api_key.set(value.to_owned());
+                                        dictation.api_key(value.to_owned());
+                                    })
+                                    .flex_1()
+                                    .h(px(38.0))
+                                    .p_2()
+                                    .rounded_md()
+                                    .border(px(1.0))
+                                    .border_color(rgb(RULE)),
+                            )
+                            .child(
+                                button()
+                                    .on_press(move || {
+                                        let id = provider.get();
+                                        match asr::store_api_key(&id, &api_key.get()) {
+                                            Ok(()) => {
+                                                key_notice.set("密钥已保存到钥匙串".into())
+                                            }
+                                            Err(error) => key_notice.set(format!("{error:#}")),
+                                        }
+                                    })
+                                    .child(control().child(text("保存密钥"))),
+                            ),
+                    )
+                    .child(when(
+                        move || !key_notice.get().is_empty(),
+                        move || {
+                            text(move || key_notice.get())
+                                .text_size(px(13.0))
+                                .text_color(rgb(MINT))
+                        },
+                    ))
+            },
+        ))
+        .child(when(
+            move || asr::provider_by_id(&provider.get()).language,
+            move || {
+                let dictation = language_dictation.clone();
+                view()
+                    .gap_2()
+                    .pt_2()
+                    .child(text("识别语言").font_weight(FontWeight::SEMIBOLD))
+                    .child(
+                        input()
+                            .value(move || language.get())
+                            .placeholder("留空自动识别")
+                            .on_change(move |value: &str| {
+                                language.set(value.to_owned());
+                                dictation.language(value.to_owned());
+                                let _ = Storage::set_item("asr.language", value.trim());
+                            })
+                            .w(px(180.0))
+                            .h(px(38.0))
+                            .p_2()
+                            .rounded_md()
+                            .border(px(1.0))
+                            .border_color(rgb(RULE)),
+                    )
+            },
+        ))
 }
 
 pub fn diagnostics(
     model: Signal<ViewState>,
+    provider: Signal<String>,
     endpoint: Signal<String>,
+    api_key: Signal<String>,
     language: Signal<String>,
     commands: tokio::sync::mpsc::UnboundedSender<Command>,
 ) -> impl IntoElement {
@@ -1074,7 +1253,16 @@ pub fn diagnostics(
                             view()
                                 .gap_2()
                                 .child(heading("ASR 测试", 22.0))
-                                .child(text(move || endpoint.get()).text_color(rgb(MUTED)))
+                                .child(
+                                    text(move || {
+                                        format!(
+                                            "{} · {}",
+                                            asr::provider_by_id(&provider.get()).label,
+                                            endpoint.get()
+                                        )
+                                    })
+                                    .text_color(rgb(MUTED)),
+                                )
                                 .child(
                                     view()
                                         .flex_row()
@@ -1086,14 +1274,18 @@ pub fn diagnostics(
                                                     busy.set(true);
                                                     result.set("正在检查服务…".into());
                                                     let pending = health.clone();
-                                                    let endpoint = endpoint.get();
+                                                    let target = asr::Target {
+                                                        provider: provider.get(),
+                                                        endpoint: endpoint.get(),
+                                                        api_key: api_key.get(),
+                                                    };
                                                     std::thread::spawn(move || {
                                                         let message =
                                                             tokio::runtime::Runtime::new()
                                                                 .map_err(anyhow::Error::from)
                                                                 .and_then(|runtime| {
                                                                     runtime.block_on(asr::check(
-                                                                        &endpoint,
+                                                                        &target,
                                                                     ))
                                                                 });
                                                         *pending.lock().unwrap() =
@@ -1116,7 +1308,11 @@ pub fn diagnostics(
                                                     busy.set(true);
                                                     result.set("正在测试转写…".into());
                                                     let pending = pending.clone();
-                                                    let endpoint = endpoint.get();
+                                                    let target = asr::Target {
+                                                        provider: provider.get(),
+                                                        endpoint: endpoint.get(),
+                                                        api_key: api_key.get(),
+                                                    };
                                                     let language = language.get();
                                                     std::thread::spawn(move || {
                                                         let started = std::time::Instant::now();
@@ -1128,7 +1324,7 @@ pub fn diagnostics(
                                                                 .and_then(|runtime| {
                                                                     runtime.block_on(
                                                                         asr::transcribe(
-                                                                            &endpoint,
+                                                                            &target,
                                                                             model.as_deref(),
                                                                             &language,
                                                                             &audio.path,

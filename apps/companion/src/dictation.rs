@@ -37,7 +37,7 @@ impl Draft {
 #[derive(Clone)]
 struct Job {
     recording: ReceivedRecording,
-    endpoint: String,
+    target: asr::Target,
     language: String,
 }
 
@@ -60,7 +60,7 @@ struct State {
 
 struct Inner {
     state: State,
-    endpoint: String,
+    target: asr::Target,
     language: String,
 }
 
@@ -71,10 +71,10 @@ pub struct Dictation {
 }
 
 impl Dictation {
-    pub fn start(endpoint: String, language: String) -> Self {
+    pub fn start(target: asr::Target, language: String) -> Self {
         let inner = Arc::new(Mutex::new(Inner {
             state: State::default(),
-            endpoint,
+            target,
             language,
         }));
         let (jobs, mut queue) = watch::channel::<Option<Job>>(None);
@@ -104,7 +104,7 @@ impl Dictation {
                         biased;
                         _ = replacement.changed() => continue,
                         result = asr::transcribe(
-                            &job.endpoint,
+                            &job.target,
                             model.as_deref(),
                             &job.language,
                             &job.recording.path,
@@ -135,8 +135,16 @@ impl Dictation {
         Self { inner, jobs }
     }
 
+    pub fn provider(&self, provider: String) {
+        self.inner.lock().unwrap().target.provider = provider;
+    }
+
     pub fn endpoint(&self, endpoint: String) {
-        self.inner.lock().unwrap().endpoint = endpoint;
+        self.inner.lock().unwrap().target.endpoint = endpoint;
+    }
+
+    pub fn api_key(&self, api_key: String) {
+        self.inner.lock().unwrap().target.api_key = api_key;
     }
 
     pub fn language(&self, language: String) {
@@ -190,7 +198,7 @@ impl Dictation {
             .jobs
             .send(Some(Job {
                 recording,
-                endpoint: inner.endpoint.clone(),
+                target: inner.target.clone(),
                 language: inner.language.clone(),
             }))
             .is_err()
@@ -379,7 +387,11 @@ mod tests {
                     }),
                     ..State::default()
                 },
-                endpoint: DEFAULT_ENDPOINT.into(),
+                target: asr::Target {
+                    provider: "local-openai".into(),
+                    endpoint: DEFAULT_ENDPOINT.into(),
+                    api_key: String::new(),
+                },
                 language: "zh".into(),
             })),
             jobs,
@@ -412,7 +424,11 @@ mod tests {
                     recording: Some(("recording".into(), None)),
                     ..State::default()
                 },
-                endpoint: DEFAULT_ENDPOINT.into(),
+                target: asr::Target {
+                    provider: "local-openai".into(),
+                    endpoint: DEFAULT_ENDPOINT.into(),
+                    api_key: String::new(),
+                },
                 language: "zh".into(),
             })),
             jobs,
@@ -423,7 +439,10 @@ mod tests {
             seconds: 1.0,
         };
         dictation.received(recording.clone(), "c0".into(), "bridge".into());
-        assert_eq!(queue.borrow().as_ref().unwrap().endpoint, DEFAULT_ENDPOINT);
+        assert_eq!(
+            queue.borrow().as_ref().unwrap().target.endpoint,
+            DEFAULT_ENDPOINT
+        );
 
         dictation
             .inner
@@ -442,7 +461,7 @@ mod tests {
         let job = job.as_ref().unwrap();
         assert_eq!(job.recording.id, recording.id);
         assert_eq!(job.recording.path, recording.path);
-        assert_eq!(job.endpoint, "http://127.0.0.1:61234");
+        assert_eq!(job.target.endpoint, "http://127.0.0.1:61234");
         assert!(job.language.is_empty());
     }
 }

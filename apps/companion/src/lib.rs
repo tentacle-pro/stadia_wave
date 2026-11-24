@@ -81,11 +81,38 @@ pub fn App() -> impl IntoElement {
         }),
         MenuItem::new("退出 Stadia Wave").on_select(quit),
     ]));
-    let endpoint = signal(
-        std::env::var("WAVE_ASR_URL")
+    let provider = signal(
+        std::env::var("WAVE_ASR_PROVIDER")
             .ok()
-            .or_else(|| Storage::get_item("asr.endpoint"))
-            .unwrap_or_else(|| dictation::DEFAULT_ENDPOINT.into()),
+            .or_else(|| Storage::get_item("asr.provider"))
+            .unwrap_or_else(|| asr::default_provider().id.into()),
+    );
+    let endpoint = signal({
+        let configured = std::env::var("WAVE_ASR_URL")
+            .ok()
+            .or_else(|| Storage::get_item("asr.endpoint").filter(|value| !value.trim().is_empty()));
+        let current = asr::provider_by_id(&provider.get());
+        match configured {
+            // An explicitly configured address wins; the default is only a guess,
+            // and Voxt picks its port dynamically, so look for the live one first.
+            Some(value) if value.trim() != dictation::DEFAULT_ENDPOINT => value,
+            _ if current.discovery => asr::connector_for(current.id)
+                .discover()
+                .unwrap_or_else(|| dictation::DEFAULT_ENDPOINT.into()),
+            _ => String::new(),
+        }
+    });
+    let api_key = signal(
+        std::env::var("WAVE_ASR_API_KEY")
+            .ok()
+            .or_else(|| {
+                let current = asr::provider_by_id(&provider.get());
+                current
+                    .secret
+                    .then(|| asr::stored_api_key(current.id))
+                    .flatten()
+            })
+            .unwrap_or_default(),
     );
     let language = signal(
         std::env::var("WAVE_ASR_LANGUAGE")
@@ -93,7 +120,14 @@ pub fn App() -> impl IntoElement {
             .or_else(|| Storage::get_item("asr.language"))
             .unwrap_or_else(|| "zh".into()),
     );
-    let dictation = dictation::Dictation::start(endpoint.get(), language.get());
+    let dictation = dictation::Dictation::start(
+        asr::Target {
+            provider: provider.get(),
+            endpoint: endpoint.get(),
+            api_key: api_key.get(),
+        },
+        language.get(),
+    );
     let worker = network::start_for_desktop(Some(dictation.clone()));
     let panel = signal(None::<(String, dictation::Phase, Option<String>)>);
     let draft_text = signal(String::new());
@@ -383,7 +417,9 @@ pub fn App() -> impl IntoElement {
                                         )
                                         .child(pages::rule())
                                         .child(pages::asr_settings(
+                                            provider,
                                             endpoint,
+                                            api_key,
                                             language,
                                             dictation.clone(),
                                         ))
@@ -392,7 +428,14 @@ pub fn App() -> impl IntoElement {
                             .child(when(
                                 move || page.get() == 3,
                                 move || {
-                                    pages::diagnostics(model, endpoint, language, rumble.clone())
+                                    pages::diagnostics(
+                                        model,
+                                        provider,
+                                        endpoint,
+                                        api_key,
+                                        language,
+                                        rumble.clone(),
+                                    )
                                 },
                             ))
                             .child(when(

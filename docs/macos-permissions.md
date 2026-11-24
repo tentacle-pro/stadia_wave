@@ -41,7 +41,7 @@ Wave Companion 自己不做网络访问：它启动 `wave_bridge`，后者再启
 
 下面的「系统权限」列出**授权对象就是上面「运行身份」那个 App**：
 
-- **辅助功能**：可读状态（`AXIsProcessTrusted()`），用于确认粘贴。
+- **设备控制和数据访问**（macOS 27 之前的「辅助功能」）：可读状态（`AXIsProcessTrusted()`），用于确认粘贴。
 - **本地网络**：macOS 没有公开 API 可读授权状态；常态显示「首次连接手柄时询问」，Bridge 上报
   `HardwareState.network_blocked` 时显示「可能未授权（收不到手柄输入）」。
 - **驱动扩展**：只在检测到 OpenJoystickDriver 时出现（`systemextensionsctl list` 里有它的扩展，
@@ -67,13 +67,31 @@ Companion 直接读这个字段，让「本地网络」一行在「首次连接�
 
 | 目标 | 深链 |
 | --- | --- |
-| 本地网络 | `x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?privacy-localnetwork` |
-| 辅助功能 | `x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?privacy-accessibility` |
+| 本地网络 | `x-apple.systempreferences:com.apple.preference.security?privacy-localnetwork` |
+| 设备控制和数据访问 | `x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility` |
 | 登录项与扩展（含驱动扩展） | `x-apple.systempreferences:com.apple.LoginItems-Settings.extension` |
 
-`privacy-localnetwork` / `privacy-accessibility` 是当前系统 `SecurityPrivacyExtension.appex` 里的路由
-标识。旧写法 `x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility` 仍被兼容，
-新代码用上面的形式。
+新版扩展 ID（`com.apple.settings.PrivacySecurity.extension`）不接受 `?privacy-accessibility` /
+`?privacy-localnetwork` 作为锚点：用这两个 URL 时系统只是切到「隐私与安全性」，日志里没有 `anchor:`。
+legacy 形式会被转发到同一个扩展并正确定位（`System Settings` 日志显示
+`anchor: Privacy_Accessibility` / `anchor: Privacy_LocalNetwork`），该扩展的 Info.plist 也声明了
+`legacyBundleIdentifier = com.apple.preference.security`。所以代码里用 legacy 形式加首字母大写的锚点。
+
+macOS 27 把「辅助功能」改名为「设备控制和数据访问」；界面行文案用系统的新名称。
+
+带 `revealElementKeyName` 的服务（如 `Privacy_Accessibility`）用旧的键名当锚点。
+用错形式时系统只会切到「隐私与安全性」的顶层，不报错，所以两种形式都要实测。
+
+**本地网络是个例外：这一版 macOS 没有可用的锚点。** 实测 17 个候选
+（`Privacy_LocalNetwork`、`privacy-localnetwork`、`PrivacyLocalNetworkService`、
+`Privacy_LocalNetworkServiceView` 等）、两种扩展 host、以及“先打开面板再带锚点”的两步打开，
+都只停到「隐私与安全性」顶层；作为对照，`Privacy_Accessibility`、`Privacy_Microphone`、
+`Privacy_Camera` 都能进入各自子页（用系统日志里 `navigationStackDidChange` 的次数判定：
+进子页 8 条，只到顶层 4 条）。「本地网络」面板在 `TCCServiceList.plist` 里没有
+`revealElementKeyName`，扩展里也没有对应的 `Privacy_*` 字面量。
+
+因此「本地网络」这一行保留文档化的锚点（将来系统支持时自然生效），并在行下提示
+「打开后在「隐私与安全性」列表里选「本地网络」」。
 
 ## 将来启用虚拟手柄时（`--gamepad ojd`）
 
@@ -82,7 +100,7 @@ Companion 直接读这个字段，让「本地网络」一行在「首次连接�
 1. 安装并运行 OpenJoystickDriver.app；
 2. 「系统设置 → 通用 → 登录项与扩展 → 驱动扩展」中打开 `OpenJoystickDriver.app`（扩展宿主是
    `XboxUSBDevice`）；
-3. 按需在「隐私与安全性 → 辅助功能 / 输入监控」里允许 OpenJoystickDriver.app；
+3. 按需在「隐私与安全性 → 设备控制和数据访问 / 输入监控」里允许 OpenJoystickDriver.app；
 4. 确认扩展真正激活，而不是停在等待用户：
 
    ```sh

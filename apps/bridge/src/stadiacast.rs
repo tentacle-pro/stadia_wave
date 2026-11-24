@@ -22,7 +22,10 @@ use wave_protocol::{
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Options {
     pub executable: PathBuf,
-    pub controller_ip: String,
+    /// The controller's address when it is known; Stadiacast only uses it to pick
+    /// the interface and to mark the controller's lines in the helpers' logs.
+    #[serde(default)]
+    pub controller_ip: Option<String>,
     pub advertise_ip: String,
     pub dns_upstream: String,
 }
@@ -165,16 +168,20 @@ impl Handle {
 fn launch(options: &Options, run_dir: &Path) -> Result<Child> {
     let stdout = File::create(run_dir.join("stdout.log"))?;
     let stderr = File::create(run_dir.join("stderr.log"))?;
-    Command::new(&options.executable)
+    let mut command = Command::new(&options.executable);
+    command.args([
+        "--preset",
+        "live",
+        "--dns-upstream",
+        options.dns_upstream.as_str(),
+    ]);
+    if let Some(controller_ip) = options.controller_ip.as_deref() {
+        command.args(["--controller-ip", controller_ip]);
+    }
+    command
         .args([
-            "--preset",
-            "live",
-            "--dns-upstream",
-            &options.dns_upstream,
-            "--controller-ip",
-            &options.controller_ip,
             "--advertise-ip",
-            &options.advertise_ip,
+            options.advertise_ip.as_str(),
             "--mic",
             "off",
             "--mic-record",
@@ -870,7 +877,7 @@ mod tests {
         let original = actor.run_dir.clone();
         actor.options = Some(Options {
             executable: "/usr/bin/false".into(),
-            controller_ip: "127.0.0.1".into(),
+            controller_ip: Some("127.0.0.1".into()),
             advertise_ip: "127.0.0.1".into(),
             dns_upstream: "127.0.0.1".into(),
         });
@@ -993,5 +1000,15 @@ mod tests {
         actor.event(json!({"event":"rtc_pair_verified"}));
         assert!(!actor.network_blocked);
         fs::remove_dir_all(actor.run_dir).unwrap();
+    }
+
+    #[test]
+    fn older_configs_with_a_controller_ip_still_parse() {
+        let options: Options = serde_json::from_str(
+            r#"{"executable":"/tmp/stadiacast","controller_ip":"192.168.1.119","advertise_ip":"192.168.1.215","dns_upstream":"192.168.1.1"}"#,
+        )
+        .unwrap();
+        assert_eq!(options.controller_ip.as_deref(), Some("192.168.1.119"));
+        assert_eq!(options.advertise_ip, "192.168.1.215");
     }
 }

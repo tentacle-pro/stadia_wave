@@ -8,7 +8,7 @@ Wave Bridge 管理手柄连接和网络服务。Wave Companion 在桌面上接�
 
 需要 Xcode Command Line Tools。项目通过 `rust-toolchain.toml` 固定 Rust 1.97，rustup 会在首次构建时安装。Companion 使用 NSH 0.6 的纯 Rust 界面。
 
-**签名身份是必填项。** `run-companion.sh` 与 `package-macos.sh` 用 `APPLE_SIGNING_IDENTITY`（或 `WAVE_SIGN_IDENTITY`）签名；未设置、或钥匙串里找不到对应身份时，脚本直接退出。临时（ad-hoc）签名每次构建都会变，macOS 会把每个新构建当成新 App，反复要求重新授予「辅助功能」和「本地网络」权限。
+**签名身份是必填项。** `run-companion.sh` 与 `package-macos.sh` 用 `APPLE_SIGNING_IDENTITY`（或 `WAVE_SIGN_IDENTITY`）签名；未设置、或钥匙串里找不到对应身份时，脚本直接退出。临时（ad-hoc）签名每次构建都会变，macOS 会把每个新构建当成新 App，反复要求重新授予「设备控制和数据访问」和「本地网络」权限。
 
 ```sh
 export APPLE_SIGNING_IDENTITY="Apple Development: Your Name (TEAMID)"
@@ -41,7 +41,7 @@ Bridge 配置和身份默认保存在用户的 Application Support 目录，可�
 cargo run -p wave-bridge -- --name "书房 Bridge" --remote --port 8787 --data-dir /absolute/private/wave-bridge
 ```
 
-首次运行时 macOS 会要求两项权限：**本地网络**（Stadiacast 需要主动往手柄发 UDP，只有手柄连进来是不够的）和 **辅助功能**（确认草稿时粘贴到前台 App）。概览右栏的「系统权限」显示当前 App 的运行身份、位置和启动方，并提供直达系统设置的按钮；排查时可在「诊断 → 系统扩展」查看并复制 `systemextensionsctl list` 的输出。细节见 [macOS 权限归属](docs/macos-permissions.md)。
+首次运行时 macOS 会要求两项权限：**本地网络**（Stadiacast 需要主动往手柄发 UDP，只有手柄连进来是不够的）和 **设备控制和数据访问**（确认草稿时粘贴到前台 App；旧版 macOS 叫「辅助功能」）。概览右栏的「系统权限」显示当前 App 的运行身份、位置和启动方，并提供直达系统设置的按钮（本地网络一行会打开「隐私与安全性」，再点列表里的「本地网络」）；排查时可在「诊断 → 系统扩展」查看并复制 `systemextensionsctl list` 的输出。细节见 [macOS 权限归属](docs/macos-permissions.md)。
 
 两个程序同机时也通过 mDNS 发现的网络地址连接。点击「连接」会主动接管 Bridge 的现有连接，旧端显示被接管并停止自动重连。短暂断网后，Companion 按 1、2、4、8 秒间隔重试；如果 Bridge 已被另一端占用，停止重试并提示用户主动接管。点击「断开」可取消重连。
 
@@ -92,6 +92,8 @@ cargo run -p wave-bridge -- \
 
 Bridge 将配置保存在其数据目录的 `stadiacast.json`。之后直接启动 Bridge 即可复用。可执行文件路径需要长期有效；当前开发机器已将二进制复制到 Bridge 数据目录的 `runtime/stadiacast`，以便独立于参考项目运行。
 
+打包版在没有 `stadiacast.json` 时会直接使用 App 内置的 stadiacast（`Contents/Helpers/`），并按默认路由推导局域网参数：DNS 上游取默认网关，通告地址取本机在该接口上的 IPv4，推导结果写进 Bridge 日志。因此装好 App 后首次就能连接手柄；需要固定地址时，再按上面的命令写一次配置覆盖。
+
 Bridge 启动独立 Stadiacast 子进程，以固定参数启用 DNS、录音和震动会话（`--mic off --mic-record --start-game`），并按需通过控制接口开关麦克风。每次运行的日志写入数据目录 `captures` 下的独立子目录。退出 Bridge 时会停止托管的 Stadiacast。启动失败、端口冲突和进程退出原因会显示在 Companion。
 
 在 Companion 连接后，手柄面板显示在线状态和已报告的电量。点击「测试震动」发送 300 毫秒短震。按住 Assistant 录音，松开后音频通过 WSS 传输，接收端校验 SHA-256 并保存 Ogg Opus。「打开录音」交给系统默认播放器。接收文件在 Companion 数据目录的 `recordings` 下保留，Bridge 在收到交付确认后清理源文件。
@@ -109,11 +111,11 @@ cargo run -p wave-companion --example recording_takeover -- /path/to/pairing.jso
 ## 使用手柄语音输入
 
 1. 在 Companion 连接 Bridge，确认手柄已就绪。让 Voxt 的本机 Qwen3-ASR 服务运行，安装可供 Companion 调用的 FFmpeg。
-2. 在「本机语音识别」填入服务地址，例如 `http://127.0.0.1:58078`。Voxt 重启后端口可能改变，可用 `lsof -nP -iTCP -sTCP:LISTEN | rg qwen3_asr` 查看。识别语言默认 `zh`，留空由模型判断。地址和语言会记在 Companion 本地。
+2. 「本机语音识别」的地址由 Voxt 动态分配：Companion 启动时会读取正在运行的 `qwen3_asr_server` 的监听端口，设置页也可以点「检测」重新读取；需要固定地址时用 `WAVE_ASR_URL` 覆盖。要用云端或自建网关时，在设置页切换到「OpenAI 兼容服务」，填根地址与 API key（密钥保存在钥匙串）。识别语言默认 `zh`，留空由模型判断。地址、服务类型和语言会记在 Companion 本地。
 3. 在目标程序中放好光标，按住手柄 Assistant，等指示灯闪后说话并松手。切回 Companion 可检查和编辑草稿。按手柄 A 或点「粘贴」确认，按 B 或点「丢弃」清除草稿。
-4. 首次自动粘贴时，在 macOS「系统设置 → 隐私与安全性 → 辅助功能」中启用当前运行的 App（概览右栏「系统权限」里有直达按钮）。也可点「复制」，自行回到目标程序粘贴。自动粘贴同样会把草稿写入系统剪贴板。
+4. 首次自动粘贴时，在 macOS「系统设置 → 隐私与安全性 → 设备控制和数据访问」中启用当前运行的 App（概览右栏「系统权限」里有直达按钮）。也可点「复制」，自行回到目标程序粘贴。自动粘贴同样会把草稿写入系统剪贴板。
 
-本机 ASR 使用 `GET /v1/models` 选择唯一模型，并通过 `POST /v1/audio/transcriptions` 发送转成单声道、16 kHz PCM WAV 的录音。可用 `WAVE_ASR_URL`、`WAVE_ASR_LANGUAGE` 和 `WAVE_ASR_MODEL` 覆盖设置。若 FFmpeg 不在 Homebrew 常用目录或 `PATH` 中，可设置 `WAVE_FFMPEG` 为绝对路径。
+本机 ASR 使用 `GET /v1/models` 选择唯一模型，并通过 `POST /v1/audio/transcriptions` 发送转成单声道、16 kHz PCM WAV 的录音。可用 `WAVE_ASR_PROVIDER`、`WAVE_ASR_URL`、`WAVE_ASR_API_KEY`、`WAVE_ASR_LANGUAGE` 和 `WAVE_ASR_MODEL` 覆盖设置。若 FFmpeg 不在 Homebrew 常用目录或 `PATH` 中，可设置 `WAVE_FFMPEG` 为绝对路径。
 
 服务不可用时，修改地址后点「重试转写」即可使用原录音。Companion 同时保留一份待处理草稿。在它处理完之前收到的新录音仍会保存，可通过「打开录音」播放。
 
