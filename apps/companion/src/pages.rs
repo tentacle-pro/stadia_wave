@@ -79,6 +79,48 @@ fn link(label: &'static str, url: &'static str) -> impl IntoElement {
         .child(text(format!("{label} ↗")).text_color(rgb(MINT)))
 }
 
+const ACCESSIBILITY_SETTINGS: &str =
+    "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?privacy-accessibility";
+const LOCAL_NETWORK_SETTINGS: &str =
+    "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?privacy-localnetwork";
+const LOGIN_ITEMS_SETTINGS: &str =
+    "x-apple.systempreferences:com.apple.LoginItems-Settings.extension";
+
+fn shorten_path(path: &str) -> String {
+    const LIMIT: usize = 38;
+    if path.chars().count() <= LIMIT {
+        return path.to_string();
+    }
+    let tail: String = path
+        .chars()
+        .skip(path.chars().count() - (LIMIT - 1))
+        .collect();
+    format!("…{tail}")
+}
+
+fn permission_row(
+    label: &'static str,
+    status: impl Fn() -> String + 'static,
+    settings: &'static str,
+) -> impl IntoElement {
+    view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .py_1()
+        .child(text(label).w(px(72.0)).flex_none().text_color(rgb(MUTED)))
+        .child(text(status).flex_1().text_size(px(12.0)))
+        .child(
+            button()
+                .on_press(move || {
+                    spawn(async move {
+                        let _ = open_url(settings).await;
+                    });
+                })
+                .child(control().child(text("打开"))),
+        )
+}
+
 pub fn about(mark: ImageSrc, update_notice: Signal<String>) -> impl IntoElement {
     let licenses = std::env::current_exe().ok().and_then(|executable| {
         let contents = executable.parent()?.parent()?;
@@ -282,6 +324,8 @@ pub fn overview(
     let bridge_status = signal(crate::local_bridge::status());
     let authorized = signal(desktop::authorized());
     let stats = signal(crate::statistics::read());
+    let identity = desktop::identity();
+    let driver = signal(desktop::openjoystick_driver());
     set_interval(std::time::Duration::from_millis(750), move || {
         let status = crate::local_bridge::status();
         if status != bridge_status.get() {
@@ -296,6 +340,14 @@ pub fn overview(
             stats.set(next);
         }
     });
+    set_interval(std::time::Duration::from_secs(15), move || {
+        if driver.get().is_some() || desktop::openjoystick_installed() {
+            let next = desktop::openjoystick_driver();
+            if next != driver.get() {
+                driver.set(next);
+            }
+        }
+    });
     let controller_ready = move || {
         model
             .get()
@@ -305,99 +357,336 @@ pub fn overview(
             .any(|controller| controller.ready)
     };
     let bridge_connected = move || model.get().connected;
-    view().gap_5().text_color(rgb(INK)).text_size(px(14.0))
-        .child(view().gap_1()
-            .child(heading("概览", 33.0))
-            .child(text(move || {
-                if controller_ready() && bridge_connected() { "所有设备已就绪。".into() }
-                else { model.get().status }
-            }).text_color(rgb(MUTED))))
-        .child(view().pt_5().gap_4()
-            .child(view().flex_row().items_center().gap_3()
-                .child(controller(120.0))
-                .child(connection(move || if controller_ready() { "Wi-Fi 已连接" } else { "等待手柄" }, controller_ready))
-                .child(node_icon(false))
-                .child(connection(move || if bridge_connected() { "已认证" } else { "未连接" }, bridge_connected))
-                .child(node_icon(true)))
-            .child(view().flex_row().gap_5()
-                .child(view().flex_1().gap_2()
-                    .child(heading("Stadia 手柄", 20.0))
-                    .child(dynamic(move || {
-                        let controllers = model.get().hardware.controllers;
-                        if controllers.is_empty() {
-                            return vec![view().p_2().child(text("等待手柄连接").text_color(rgb(MUTED)))];
-                        }
-                        controllers.into_iter().map(|device| {
+    view()
+        .gap_5()
+        .text_color(rgb(INK))
+        .text_size(px(14.0))
+        .child(
+            view().gap_1().child(heading("概览", 33.0)).child(
+                text(move || {
+                    if controller_ready() && bridge_connected() {
+                        "所有设备已就绪。".into()
+                    } else {
+                        model.get().status
+                    }
+                })
+                .text_color(rgb(MUTED)),
+            ),
+        )
+        .child(
+            view()
+                .pt_5()
+                .gap_4()
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .child(controller(120.0))
+                        .child(connection(
+                            move || {
+                                if controller_ready() {
+                                    "Wi-Fi 已连接"
+                                } else {
+                                    "等待手柄"
+                                }
+                            },
+                            controller_ready,
+                        ))
+                        .child(node_icon(false))
+                        .child(connection(
+                            move || {
+                                if bridge_connected() {
+                                    "已认证"
+                                } else {
+                                    "未连接"
+                                }
+                            },
+                            bridge_connected,
+                        ))
+                        .child(node_icon(true)),
+                )
+                .child(
+                    view()
+                        .flex_row()
+                        .gap_5()
+                        .child(
                             view()
-                                .child(row("名称", format!("Stadia · {}", device.id)))
-                                .child(row("设备 ID", device.device_id.unwrap_or_else(|| "等待上报".into())))
-                                .child(row("电量", device.battery_percent.map(|v| format!("{v}%")).unwrap_or_else(|| "未知".into())))
-                                .child(row("IP", device.ip.unwrap_or_else(|| "未知".into())))
-                        }).collect::<Vec<_>>()
-                    }))
-                    .child(link("如何刷 282115 稳定版 Wi-Fi 固件", "https://github.com/luigimannoni/stadia-controller-flasher")))
-                .child(vertical_rule())
-                .child(view().flex_1().gap_2()
-                    .child(heading("Wave Bridge", 20.0))
-                    .child(dynamic(move || {
-                        let state = model.get();
-                        let bridge = state.bridges.into_iter().find(|bridge| Some(&bridge.id) == state.active_bridge.as_ref());
-                        view()
-                            .child(row("名称", bridge.as_ref().map(|bridge| bridge.name.clone()).unwrap_or_else(|| "未连接".into())))
-                            .child(row("地址", bridge.map(|bridge| if bridge.id == crate::network::LOCAL_ID { bridge.address } else { format!("{}:{}", bridge.address, bridge.port) }).unwrap_or_else(|| "—".into())))
-                            .child(row("Stadiacast", if state.connected { state.hardware.message } else { "等待 Bridge".into() }))
-                            .child(row("版本", state.hardware.version.unwrap_or_else(|| "未知".into())))
-                    }))
-                    .child(view().pt_2().gap_2()
-                        .child(view().flex_row().gap_2().items_center().flex_wrap()
-                            .child(text("本机 Bridge").text_color(rgb(MUTED)))
-                            .child(button().on_press(move || {
-                                bridge_notice.set(match crate::local_bridge::start() {
-                                    Ok(()) => String::new(),
-                                    Err(error) => error.to_string(),
-                                });
-                                bridge_status.set(crate::local_bridge::status());
-                            }).child(control().child(text("启动"))))
-                            .child(button().on_press(move || {
-                                bridge_notice.set(match crate::local_bridge::stop() {
-                                    Ok(()) => String::new(),
-                                    Err(error) => error.to_string(),
-                                });
-                                bridge_status.set(crate::local_bridge::status());
-                            }).child(control().child(text("停止")))))
-                        .child(text(move || bridge_status.get()).text_size(px(12.0)).text_color(rgb(MUTED)))
-                        .child(when(move || !bridge_notice.get().is_empty(), move || text(move || bridge_notice.get()).text_size(px(12.0)))))
-                    .child(bridge_connections)
-                    .child(link("部署 Bridge 的多种方式", "https://github.com/tentacle-pro/stadia_wave#readme")))
-                .child(vertical_rule())
-                .child(view().flex_1().gap_2()
-                    .child(heading("Wave Companion", 20.0))
-                    .child(dynamic(move || row("语音识别", format!("本机 · {}", endpoint.get()))))
-                    .child(dynamic(move || row("状态", if model.get().recording.is_some() { "正在录音" } else { "等待语音输入" }.into())))
-                    .child(dynamic(move || row("自动粘贴", if authorized.get() { "已授权" } else { "未授权" }.into())))
-                    .child(view().pt_2().items_end().child(button().on_press(|| {
-                        spawn(async {
-                            let _ = open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility").await;
-                        });
-                    }).child(control().child(text("管理权限"))))))))
+                                .flex_1()
+                                .gap_2()
+                                .child(heading("Stadia 手柄", 20.0))
+                                .child(dynamic(move || {
+                                    let controllers = model.get().hardware.controllers;
+                                    if controllers.is_empty() {
+                                        return vec![
+                                            view()
+                                                .p_2()
+                                                .child(text("等待手柄连接").text_color(rgb(MUTED))),
+                                        ];
+                                    }
+                                    controllers
+                                        .into_iter()
+                                        .map(|device| {
+                                            view()
+                                                .child(row(
+                                                    "名称",
+                                                    format!("Stadia · {}", device.id),
+                                                ))
+                                                .child(row(
+                                                    "设备 ID",
+                                                    device
+                                                        .device_id
+                                                        .unwrap_or_else(|| "等待上报".into()),
+                                                ))
+                                                .child(row(
+                                                    "电量",
+                                                    device
+                                                        .battery_percent
+                                                        .map(|v| format!("{v}%"))
+                                                        .unwrap_or_else(|| "未知".into()),
+                                                ))
+                                                .child(row(
+                                                    "IP",
+                                                    device.ip.unwrap_or_else(|| "未知".into()),
+                                                ))
+                                        })
+                                        .collect::<Vec<_>>()
+                                }))
+                                .child(link(
+                                    "如何刷 282115 稳定版 Wi-Fi 固件",
+                                    "https://github.com/luigimannoni/stadia-controller-flasher",
+                                )),
+                        )
+                        .child(vertical_rule())
+                        .child(
+                            view()
+                                .flex_1()
+                                .gap_2()
+                                .child(heading("Wave Bridge", 20.0))
+                                .child(dynamic(move || {
+                                    let state = model.get();
+                                    let bridge = state.bridges.into_iter().find(|bridge| {
+                                        Some(&bridge.id) == state.active_bridge.as_ref()
+                                    });
+                                    view()
+                                        .child(row(
+                                            "名称",
+                                            bridge
+                                                .as_ref()
+                                                .map(|bridge| bridge.name.clone())
+                                                .unwrap_or_else(|| "未连接".into()),
+                                        ))
+                                        .child(row(
+                                            "地址",
+                                            bridge
+                                                .map(|bridge| {
+                                                    if bridge.id == crate::network::LOCAL_ID {
+                                                        bridge.address
+                                                    } else {
+                                                        format!(
+                                                            "{}:{}",
+                                                            bridge.address, bridge.port
+                                                        )
+                                                    }
+                                                })
+                                                .unwrap_or_else(|| "—".into()),
+                                        ))
+                                        .child(row(
+                                            "Stadiacast",
+                                            if state.connected {
+                                                state.hardware.message
+                                            } else {
+                                                "等待 Bridge".into()
+                                            },
+                                        ))
+                                        .child(row(
+                                            "版本",
+                                            state.hardware.version.unwrap_or_else(|| "未知".into()),
+                                        ))
+                                }))
+                                .child(
+                                    view()
+                                        .pt_2()
+                                        .gap_2()
+                                        .child(
+                                            view()
+                                                .flex_row()
+                                                .gap_2()
+                                                .items_center()
+                                                .flex_wrap()
+                                                .child(text("本机 Bridge").text_color(rgb(MUTED)))
+                                                .child(
+                                                    button()
+                                                        .on_press(move || {
+                                                            bridge_notice.set(
+                                                                match crate::local_bridge::start() {
+                                                                    Ok(()) => String::new(),
+                                                                    Err(error) => error.to_string(),
+                                                                },
+                                                            );
+                                                            bridge_status
+                                                                .set(crate::local_bridge::status());
+                                                        })
+                                                        .child(control().child(text("启动"))),
+                                                )
+                                                .child(
+                                                    button()
+                                                        .on_press(move || {
+                                                            bridge_notice.set(
+                                                                match crate::local_bridge::stop() {
+                                                                    Ok(()) => String::new(),
+                                                                    Err(error) => error.to_string(),
+                                                                },
+                                                            );
+                                                            bridge_status
+                                                                .set(crate::local_bridge::status());
+                                                        })
+                                                        .child(control().child(text("停止"))),
+                                                ),
+                                        )
+                                        .child(
+                                            text(move || bridge_status.get())
+                                                .text_size(px(12.0))
+                                                .text_color(rgb(MUTED)),
+                                        )
+                                        .child(when(
+                                            move || !bridge_notice.get().is_empty(),
+                                            move || {
+                                                text(move || bridge_notice.get())
+                                                    .text_size(px(12.0))
+                                            },
+                                        )),
+                                )
+                                .child(bridge_connections)
+                                .child(link(
+                                    "部署 Bridge 的多种方式",
+                                    "https://github.com/tentacle-pro/stadia_wave#readme",
+                                )),
+                        )
+                        .child(vertical_rule())
+                        .child(
+                            view()
+                                .flex_1()
+                                .gap_2()
+                                .child(heading("Wave Companion", 20.0))
+                                .child(dynamic(move || {
+                                    row("语音识别", format!("本机 · {}", endpoint.get()))
+                                }))
+                                .child(dynamic(move || {
+                                    row(
+                                        "状态",
+                                        if model.get().recording.is_some() {
+                                            "正在录音"
+                                        } else {
+                                            "等待语音输入"
+                                        }
+                                        .into(),
+                                    )
+                                }))
+                                .child(row("运行身份", identity.name.clone()))
+                                .child(row("位置", shorten_path(&identity.path)))
+                                .child(row("启动方", identity.launcher.clone()))
+                                .child(
+                                    view()
+                                        .pt_3()
+                                        .gap_2()
+                                        .child(heading("系统权限", 16.0))
+                                        .child(permission_row(
+                                            "辅助功能",
+                                            move || {
+                                                if authorized.get() {
+                                                    "已授权".into()
+                                                } else {
+                                                    "未授权".into()
+                                                }
+                                            },
+                                            ACCESSIBILITY_SETTINGS,
+                                        ))
+                                        .child(permission_row(
+                                            "本地网络",
+                                            move || {
+                                                if model.get().hardware.network_blocked {
+                                                    "可能未授权（收不到手柄输入）".into()
+                                                } else {
+                                                    "首次连接手柄时询问".into()
+                                                }
+                                            },
+                                            LOCAL_NETWORK_SETTINGS,
+                                        ))
+                                        .child(when(
+                                            move || driver.get().is_some(),
+                                            move || {
+                                                permission_row(
+                                                    "驱动扩展",
+                                                    move || {
+                                                        if driver
+                                                            .get()
+                                                            .is_some_and(|state| state.enabled)
+                                                        {
+                                                            "已启用".into()
+                                                        } else {
+                                                            "等待启用".into()
+                                                        }
+                                                    },
+                                                    LOGIN_ITEMS_SETTINGS,
+                                                )
+                                            },
+                                        ))
+                                        .child(
+                                            text(move || {
+                                                match model.get().active_bridge.as_deref() {
+                                                    Some(id) if id != crate::network::LOCAL_ID => {
+                                                        "权限由 Bridge 所在电脑授予".to_string()
+                                                    }
+                                                    _ => "授权对象是上方「运行身份」".to_string(),
+                                                }
+                                            })
+                                            .text_size(px(12.0))
+                                            .text_color(rgb(MUTED)),
+                                        ),
+                                ),
+                        ),
+                ),
+        )
         .child(rule())
-        .child(view().gap_4()
-            .child(view().flex_row().items_center().gap_4()
-                .child(heading("使用统计", 22.0))
-                .child(text("累计 · 本机").text_color(rgb(MUTED))))
-            .child(view().flex_row().gap_4()
-                .child(metric("已接收录音", move || stats.get().received.to_string()))
-                .child(vertical_rule())
-                .child(metric("转写成功", move || stats.get().success.to_string()))
-                .child(vertical_rule())
-                .child(metric("转写失败", move || stats.get().failure.to_string()))
-                .child(vertical_rule())
-                .child(metric("录音时长", move || {
-                    let seconds = stats.get().seconds.round() as u64;
-                    format!("{} 分 {} 秒", seconds / 60, seconds % 60)
-                }))))
+        .child(
+            view()
+                .gap_4()
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_4()
+                        .child(heading("使用统计", 22.0))
+                        .child(text("累计 · 本机").text_color(rgb(MUTED))),
+                )
+                .child(
+                    view()
+                        .flex_row()
+                        .gap_4()
+                        .child(metric("已接收录音", move || {
+                            stats.get().received.to_string()
+                        }))
+                        .child(vertical_rule())
+                        .child(metric("转写成功", move || {
+                            stats.get().success.to_string()
+                        }))
+                        .child(vertical_rule())
+                        .child(metric("转写失败", move || {
+                            stats.get().failure.to_string()
+                        }))
+                        .child(vertical_rule())
+                        .child(metric("录音时长", move || {
+                            let seconds = stats.get().seconds.round() as u64;
+                            format!("{} 分 {} 秒", seconds / 60, seconds % 60)
+                        })),
+                ),
+        )
         .child(rule())
-        .child(text("按住 Assistant 说话，松开后检查浮窗。A 粘贴，B 丢弃重说。").text_color(rgb(MUTED)))
+        .child(
+            text("按住 Assistant 说话，松开后检查浮窗。A 粘贴，B 丢弃重说。")
+                .text_color(rgb(MUTED)),
+        )
 }
 
 fn metric(label: &'static str, value: impl Fn() -> String + 'static) -> impl IntoElement {
@@ -633,6 +922,7 @@ pub fn diagnostics(
     });
     let health = pending.clone();
     let chart_width = signal(850.0_f32);
+    let extensions = signal(desktop::driver_diagnostics());
     view()
         .gap_4()
         .text_size(px(14.0))
@@ -939,6 +1229,46 @@ pub fn diagnostics(
                         .pl(px(66.0))
                         .child(text("5 分钟前").text_size(px(11.0)).text_color(rgb(MUTED)))
                         .child(text("现在").text_size(px(11.0)).text_color(rgb(MUTED))),
+                ),
+        )
+        .child(rule())
+        .child(
+            view()
+                .gap_2()
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .child(heading("系统扩展", 22.0))
+                        .child(
+                            text("systemextensionsctl list")
+                                .text_size(px(12.0))
+                                .text_color(rgb(MUTED)),
+                        )
+                        .child(view().flex_1())
+                        .child(
+                            button()
+                                .on_press(move || {
+                                    extensions.set(desktop::driver_diagnostics());
+                                })
+                                .child(control().child(text("刷新"))),
+                        )
+                        .child(
+                            button()
+                                .on_press(move || {
+                                    let listing = extensions.get();
+                                    spawn(async move {
+                                        let _ = desktop::copy(&listing);
+                                    });
+                                })
+                                .child(control().child(text("复制"))),
+                        ),
+                )
+                .child(
+                    text(move || extensions.get())
+                        .text_size(px(12.0))
+                        .text_color(rgb(MUTED)),
                 ),
         )
 }

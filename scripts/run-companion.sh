@@ -1,9 +1,36 @@
 #!/bin/sh
+# Builds the development Wave Companion.app and opens it.
+#
+# Signing is mandatory: an ad-hoc signature changes with every build, so macOS
+# treats each build as a new app and asks for Accessibility and Local Network
+# permission again. Set a stable identity first:
+#
+#   export APPLE_SIGNING_IDENTITY="Apple Development: Your Name (TEAMID)"
+#   security find-identity -v -p codesigning   # lists the available identities
 set -eu
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+identity=${APPLE_SIGNING_IDENTITY:-${WAVE_SIGN_IDENTITY:-}}
+[ -n "$identity" ] || die 'Set APPLE_SIGNING_IDENTITY (or WAVE_SIGN_IDENTITY) to a code-signing identity first.
+Ad-hoc signatures change on every build, so macOS asks for permissions again each time.
+Example: export APPLE_SIGNING_IDENTITY="Apple Development: Your Name (TEAMID)"
+List identities with: security find-identity -v -p codesigning'
+
+security find-identity -v -p codesigning | awk -v identity="$identity" '
+    /^[[:space:]]*[0-9]+\)/ {
+        hash = $2
+        name = $0
+        sub(/^[^"]*"/, "", name)
+        sub(/"$/, "", name)
+        if (hash == identity || name == identity) found = 1
+    }
+    END { exit !found }
+' || die "Signing identity not found in the Keychain: $identity"
+
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_dir"
 cargo build -p wave-companion --bin wave-companion
-identity="${WAVE_SIGN_IDENTITY:-6491898B04D58BFDC11BE20B3A60C9FA23973B59}"
 bundle="$project_dir/target/debug/Wave Companion.app"
 icon_source="$project_dir/apps/companion/assets/StadiaWave.icns"
 icon_destination="$bundle/Contents/Resources/StadiaWave.icns"

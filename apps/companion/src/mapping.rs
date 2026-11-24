@@ -695,11 +695,11 @@ impl Engine {
         self.held.retain(|input| !self.blocked.contains(input));
         let held = self.held.clone();
         self.sync_held(&held);
-        if let Some((key, deadline)) = self.repeat.clone() {
-            if now >= deadline {
-                self.tap(if key == "dpad_left" { 123 } else { 124 });
-                self.repeat = Some((key, now + Duration::from_millis(100)));
-            }
+        if let Some((key, deadline)) = self.repeat.clone()
+            && now >= deadline
+        {
+            self.tap(if key == "dpad_left" { 123 } else { 124 });
+            self.repeat = Some((key, now + Duration::from_millis(100)));
         }
         let multiplier = speed_multiplier(&self.config, self.triggers);
         for (index, name) in [(0, "left_stick"), (2, "right_stick")] {
@@ -894,8 +894,10 @@ mod output {
 mod tests {
     use super::*;
     fn active() -> Engine {
-        let mut config = Config::default();
-        config.enabled = true;
+        let config = Config {
+            enabled: true,
+            ..Config::default()
+        };
         let mut engine = Engine::new(config);
         engine.input(&[], false, true);
         output::KEYS.with_borrow_mut(Vec::clear);
@@ -993,8 +995,10 @@ mod tests {
     }
     #[test]
     fn previous_default_layout_migrates_but_custom_bindings_survive() {
-        let mut config = Config::default();
-        config.version = 1;
+        let mut config = Config {
+            version: 1,
+            ..Config::default()
+        };
         for key in ["x", "y", "a", "b"] {
             config.bindings.remove(key);
         }

@@ -6,7 +6,7 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_dir"
-identity=${WAVE_SIGN_IDENTITY:-${APPLE_SIGNING_IDENTITY:--}}
+identity=${WAVE_SIGN_IDENTITY:-${APPLE_SIGNING_IDENTITY:-}}
 notarize=${WAVE_NOTARIZE:-0}
 stadiacast_dir="$project_dir/stadiacast-1.3.0-macos-arm64"
 stadiacast=${WAVE_STADIACAST_BINARY:-"$stadiacast_dir/stadiacast"}
@@ -17,8 +17,22 @@ destination=${WAVE_PACKAGE_OUTPUT:-"$project_dir/target/macos"}
 [ "$(uname -s)" = Darwin ] || die 'This script requires macOS.'
 case "$notarize" in 0|1) ;; *) die 'WAVE_NOTARIZE must be 0 or 1.' ;; esac
 
+[ -n "$identity" ] || die 'Set APPLE_SIGNING_IDENTITY (or WAVE_SIGN_IDENTITY) to a code-signing identity first.
+Ad-hoc signatures change on every build, so macOS asks for permissions again each time.
+Example: APPLE_SIGNING_IDENTITY="Apple Development: Your Name (TEAMID)" ./scripts/package-macos.sh'
+
+security find-identity -v -p codesigning | awk -v identity="$identity" '
+    /^[[:space:]]*[0-9]+\)/ {
+        hash = $2
+        name = $0
+        sub(/^[^"]*"/, "", name)
+        sub(/"$/, "", name)
+        if (hash == identity || name == identity) found = 1
+    }
+    END { exit !found }
+' || die "Signing identity not found in the Keychain: $identity"
+
 if [ "$notarize" = 1 ]; then
-    [ "$identity" != "-" ] || die 'Notarization requires a Developer ID Application identity.'
     security find-identity -v -p codesigning | awk -v identity="$identity" '
         /"Developer ID Application: / {
             name = $0

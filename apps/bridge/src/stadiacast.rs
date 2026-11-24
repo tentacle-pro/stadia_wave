@@ -95,8 +95,10 @@ impl Handle {
                     version: None,
                     message: "未配置 Stadiacast".into(),
                     controllers: vec![],
+                    network_blocked: false,
                 },
                 verified: false,
+                network_blocked: false,
                 triggers: HashMap::new(),
                 axes: HashMap::new(),
             }
@@ -215,6 +217,8 @@ struct Actor {
     enabled: HashSet<String>,
     snapshot: HardwareState,
     verified: bool,
+    /// Set while a controller is online but the receiver sees ICMP "no route to host".
+    network_blocked: bool,
     triggers: HashMap<String, [u8; 2]>,
     axes: HashMap<String, [i32; 4]>,
 }
@@ -421,6 +425,7 @@ impl Actor {
                             .collect::<String>()
                     ),
                     controllers: vec![],
+                    network_blocked: false,
                 });
                 let owner = self.owner.as_ref().map(|owner| Owner {
                     session: owner.session.clone(),
@@ -460,18 +465,22 @@ impl Actor {
                     version: None,
                     message: "正在等待 Stadiacast 接口".into(),
                     controllers: vec![],
+                    network_blocked: false,
                 });
                 return;
             }
         };
         self.verified = true;
         let mut controllers = vec![];
+        let mut recently_seen = false;
         if let Some(items) = status["controllers"].as_object() {
             for (id, value) in items {
+                let recent = value["last_seen_s"].as_f64().unwrap_or(999.0) < 8.0;
+                recently_seen |= recent;
                 let ready = matches!(
                     value["session"]["display"]["state"].as_str(),
                     Some("ready" | "input")
-                ) && value["last_seen_s"].as_f64().unwrap_or(999.0) < 8.0;
+                ) && recent;
                 // Buttons are tracked from the display link's exact input log.
                 let held = self
                     .snapshot
@@ -511,11 +520,16 @@ impl Actor {
             }
         }
         controllers.sort_by(|a, b| a.id.cmp(&b.id));
+        if controllers.iter().any(|controller| controller.ready) {
+            self.network_blocked = false;
+        }
+        let network_blocked = self.network_blocked && recently_seen;
         self.update(HardwareState {
             running: true,
             version: status["version"].as_str().map(str::to_owned),
             message: "Stadiacast 运行中".into(),
             controllers,
+            network_blocked,
         });
     }
 
@@ -642,6 +656,18 @@ impl Actor {
                 }
             }
             "mic_recorded" => self.finish_recording(&controller, &event),
+            "rtc_socket_error" => {
+                let error = event["error"].as_str().unwrap_or("");
+                if error.contains("EHOSTUNREACH") || error.contains("No route to host") {
+                    self.network_blocked = true;
+                }
+            }
+            "rtc_pair_verified" | "dtls_connected" => self.network_blocked = false,
+            "display_state"
+                if matches!(event["display_state"].as_str(), Some("ready" | "input")) =>
+            {
+                self.network_blocked = false;
+            }
             _ => {}
         }
     }
@@ -772,6 +798,7 @@ mod tests {
             enabled: HashSet::new(),
             snapshot: HardwareState::default(),
             verified: false,
+            network_blocked: false,
             triggers: HashMap::new(),
             axes: HashMap::new(),
         }
@@ -951,6 +978,20 @@ mod tests {
         fs::write(&outside, b"OggS").unwrap();
         assert!(actor.recording_path(&json!({"file":outside})).is_err());
         fs::remove_file(outside).unwrap();
+        fs::remove_dir_all(actor.run_dir).unwrap();
+    }
+
+    #[test]
+    fn a_blocked_local_network_is_reported_and_cleared_by_a_pair() {
+        let mut actor = actor();
+        actor.event(json!({"event":"rtc_socket_error","error":"OSError(65, 'No route to host')"}));
+        assert!(actor.network_blocked);
+        actor.event(
+            json!({"event":"rtc_socket_error","error":"OSError(60, 'Operation timed out')"}),
+        );
+        assert!(actor.network_blocked);
+        actor.event(json!({"event":"rtc_pair_verified"}));
+        assert!(!actor.network_blocked);
         fs::remove_dir_all(actor.run_dir).unwrap();
     }
 }

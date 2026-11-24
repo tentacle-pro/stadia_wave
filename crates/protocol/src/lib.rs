@@ -135,6 +135,10 @@ pub struct HardwareState {
     pub version: Option<String>,
     pub message: String,
     pub controllers: Vec<ControllerState>,
+    /// A controller is online but the receiver cannot reach it. On macOS this means
+    /// the local-network permission, a firewall, or client isolation blocks its UDP path.
+    #[serde(default)]
+    pub network_blocked: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

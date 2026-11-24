@@ -43,8 +43,8 @@ impl Broker {
     pub fn buttons(&self) -> [bool; 2] {
         let mut buttons = [false; 2];
         for lease in self.owners.values() {
-            for button in 0..2 {
-                buttons[button] |= lease.mouse[button];
+            for (button, pressed) in buttons.iter_mut().zip(lease.mouse.iter()) {
+                *button |= *pressed;
             }
         }
         buttons
