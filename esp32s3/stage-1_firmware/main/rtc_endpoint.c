@@ -73,12 +73,16 @@ typedef struct {
     uint8_t rx_key[16];
     uint8_t rx_auth[20];
     uint8_t rx_salt[14];
+    psa_key_id_t rx_key_id;
+    psa_key_id_t rx_auth_id;
     uint32_t rx_roc;
     uint16_t rx_s_l;
     bool rx_seen;
     uint8_t tx_key[16];
     uint8_t tx_auth[20];
     uint8_t tx_salt[14];
+    psa_key_id_t tx_key_id;
+    psa_key_id_t tx_auth_id;
     uint32_t tx_roc;
     uint16_t tx_seq;
 } srtp_state_t;
@@ -166,41 +170,54 @@ static void dtls_rx_push(const uint8_t *buf, size_t len)
     s_rx_count++;
 }
 
-static bool compute_hmac_sha1(const uint8_t *key, size_t key_len,
-                              const uint8_t *data, size_t data_len,
-                              uint8_t out_mac[20])
+static psa_key_id_t import_hmac_key(const uint8_t *key, size_t key_len)
 {
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
     psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_SIGN_MESSAGE);
     psa_set_key_algorithm(&attr, PSA_ALG_HMAC(PSA_ALG_SHA_1));
     psa_set_key_type(&attr, PSA_KEY_TYPE_HMAC);
-
-    psa_key_id_t key_id = 0;
-    if (psa_import_key(&attr, key, key_len, &key_id) != PSA_SUCCESS) {
-        return false;
-    }
-    size_t mac_len = 0;
-    psa_status_t st = psa_mac_compute(key_id, PSA_ALG_HMAC(PSA_ALG_SHA_1),
-                                      data, data_len, out_mac, 20, &mac_len);
-    psa_destroy_key(key_id);
-    return st == PSA_SUCCESS && mac_len == 20;
+    psa_key_id_t kid = 0;
+    psa_import_key(&attr, key, key_len, &kid);
+    return kid;
 }
 
-static bool aes_ctr_crypt(const uint8_t key[16], const uint8_t iv[16],
-                          const uint8_t *in, size_t len, uint8_t *out)
+static psa_key_id_t import_aes_ctr_key(const uint8_t key[16])
 {
-    if (len == 0) return true;
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
     psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_ENCRYPT | PSA_KEY_USAGE_DECRYPT);
     psa_set_key_algorithm(&attr, PSA_ALG_CTR);
     psa_set_key_type(&attr, PSA_KEY_TYPE_AES);
     psa_set_key_bits(&attr, 128);
-
     psa_key_id_t kid = 0;
-    if (psa_import_key(&attr, key, 16, &kid) != PSA_SUCCESS) {
-        return false;
-    }
+    psa_import_key(&attr, key, 16, &kid);
+    return kid;
+}
 
+static bool compute_hmac_sha1_id(psa_key_id_t key_id,
+                                 const uint8_t *data, size_t data_len,
+                                 uint8_t out_mac[20])
+{
+    size_t mac_len = 0;
+    psa_status_t st = psa_mac_compute(key_id, PSA_ALG_HMAC(PSA_ALG_SHA_1),
+                                      data, data_len, out_mac, 20, &mac_len);
+    return st == PSA_SUCCESS && mac_len == 20;
+}
+
+static bool compute_hmac_sha1(const uint8_t *key, size_t key_len,
+                              const uint8_t *data, size_t data_len,
+                              uint8_t out_mac[20])
+{
+    psa_key_id_t key_id = import_hmac_key(key, key_len);
+    if (!key_id) return false;
+    bool ok = compute_hmac_sha1_id(key_id, data, data_len, out_mac);
+    psa_destroy_key(key_id);
+    return ok;
+}
+
+static bool aes_ctr_crypt_id(psa_key_id_t kid, const uint8_t iv[16],
+                             const uint8_t *in, size_t len, uint8_t *out)
+{
+    if (len == 0) return true;
     psa_cipher_operation_t op = PSA_CIPHER_OPERATION_INIT;
     bool ok = false;
     size_t out_len = 0, fin_len = 0;
@@ -212,6 +229,16 @@ static bool aes_ctr_crypt(const uint8_t key[16], const uint8_t iv[16],
     } else {
         psa_cipher_abort(&op);
     }
+    return ok;
+}
+
+static bool aes_ctr_crypt(const uint8_t key[16], const uint8_t iv[16],
+                          const uint8_t *in, size_t len, uint8_t *out)
+{
+    if (len == 0) return true;
+    psa_key_id_t kid = import_aes_ctr_key(key);
+    if (!kid) return false;
+    bool ok = aes_ctr_crypt_id(kid, iv, in, len, out);
     psa_destroy_key(kid);
     return ok;
 }
@@ -270,6 +297,11 @@ static void dtls_export_keys_cb(void *p_expkey, mbedtls_ssl_key_export_type type
     const uint8_t *cli_salt = mat + 32;
     const uint8_t *srv_salt = mat + 46;
 
+    if (s_srtp.rx_key_id) psa_destroy_key(s_srtp.rx_key_id);
+    if (s_srtp.rx_auth_id) psa_destroy_key(s_srtp.rx_auth_id);
+    if (s_srtp.tx_key_id) psa_destroy_key(s_srtp.tx_key_id);
+    if (s_srtp.tx_auth_id) psa_destroy_key(s_srtp.tx_auth_id);
+
     memset(&s_srtp, 0, sizeof(s_srtp));
     srtp_kdf(cli_key, cli_salt, 0x00, s_srtp.rx_key, 16);
     srtp_kdf(cli_key, cli_salt, 0x01, s_srtp.rx_auth, 20);
@@ -277,8 +309,12 @@ static void dtls_export_keys_cb(void *p_expkey, mbedtls_ssl_key_export_type type
     srtp_kdf(srv_key, srv_salt, 0x00, s_srtp.tx_key, 16);
     srtp_kdf(srv_key, srv_salt, 0x01, s_srtp.tx_auth, 20);
     srtp_kdf(srv_key, srv_salt, 0x02, s_srtp.tx_salt, 14);
-    s_srtp.ready = true;
-    ESP_LOGI(TAG, ">>> SRTP Keys Derived (AES-128-CM + HMAC-SHA1-80 Ready)! <<<");
+    s_srtp.rx_key_id  = import_aes_ctr_key(s_srtp.rx_key);
+    s_srtp.rx_auth_id = import_hmac_key(s_srtp.rx_auth, 20);
+    s_srtp.tx_key_id  = import_aes_ctr_key(s_srtp.tx_key);
+    s_srtp.tx_auth_id = import_hmac_key(s_srtp.tx_auth, 20);
+    s_srtp.ready = (s_srtp.rx_key_id && s_srtp.rx_auth_id && s_srtp.tx_key_id && s_srtp.tx_auth_id);
+    ESP_LOGI(TAG, ">>> SRTP Keys Derived (cached PSA handles, ready=%d)! <<<", s_srtp.ready);
 }
 
 static void handle_srtp_rx(uint8_t *pkt, size_t len)
@@ -315,7 +351,7 @@ static void handle_srtp_rx(uint8_t *pkt, size_t len)
     auth_input[body_len + 3] = roc & 0xFF;
 
     uint8_t mac[20] = {0};
-    bool mac_ok = compute_hmac_sha1(s_srtp.rx_auth, 20, auth_input, body_len + 4, mac) &&
+    bool mac_ok = compute_hmac_sha1_id(s_srtp.rx_auth_id, auth_input, body_len + 4, mac) &&
                   memcmp(mac, pkt + body_len, 10) == 0;
     free(auth_input);
     if (!mac_ok) {
@@ -330,7 +366,7 @@ static void handle_srtp_rx(uint8_t *pkt, size_t len)
     srtp_cm_iv(s_srtp.rx_salt, ssrc, roc, seq, iv);
     mic_opus_item_t *item = malloc(sizeof(mic_opus_item_t));
     if (!item) return;
-    if (aes_ctr_crypt(s_srtp.rx_key, iv, pkt + hdr_len, pay_len, item->data)) {
+    if (aes_ctr_crypt_id(s_srtp.rx_key_id, iv, pkt + hdr_len, pay_len, item->data)) {
         if (!s_srtp.rx_seen || (roc == s_srtp.rx_roc && seq > s_srtp.rx_s_l) || roc == s_srtp.rx_roc + 1) {
             s_srtp.rx_roc = roc;
             s_srtp.rx_s_l = seq;
@@ -771,7 +807,7 @@ esp_err_t rtc_endpoint_send_audio_opus(const uint8_t *opus, size_t len, uint32_t
 
     uint8_t iv[16];
     srtp_cm_iv(s_srtp.tx_salt, LOCAL_AUDIO_SSRC, s_srtp.tx_roc, seq, iv);
-    if (!aes_ctr_crypt(s_srtp.tx_key, iv, opus, len, pkt + 12)) {
+    if (!aes_ctr_crypt_id(s_srtp.tx_key_id, iv, opus, len, pkt + 12)) {
         free(pkt);
         return ESP_FAIL;
     }
@@ -783,7 +819,7 @@ esp_err_t rtc_endpoint_send_audio_opus(const uint8_t *opus, size_t len, uint32_t
     pkt[body_len + 3] = s_srtp.tx_roc & 0xFF;
 
     uint8_t mac[20] = {0};
-    if (!compute_hmac_sha1(s_srtp.tx_auth, 20, pkt, body_len + 4, mac)) {
+    if (!compute_hmac_sha1_id(s_srtp.tx_auth_id, pkt, body_len + 4, mac)) {
         free(pkt);
         return ESP_FAIL;
     }

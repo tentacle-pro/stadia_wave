@@ -257,7 +257,7 @@ static void audio_duplex_task(void *arg)
     void *dec_hd = NULL;
     esp_opus_enc_config_t enc_cfg = {
         .sample_rate = SAMPLE_RATE_HZ,
-        .channel = 2,
+        .channel = 1,
         .bits_per_sample = 16,
         .bitrate = 64000,
         .frame_duration = ESP_OPUS_ENC_FRAME_DURATION_20_MS,
@@ -283,13 +283,14 @@ static void audio_duplex_task(void *arg)
 
     int in_sz = 0, out_sz = 0;
     esp_opus_enc_get_frame_size(enc_hd, &in_sz, &out_sz);
-    uint8_t *spk_pcm = malloc((size_t)in_sz);
+    uint8_t *spk_pcm = malloc(STEREO_PCM_BYTES);
+    int16_t *spk_mono = malloc(MONO_PCM_BYTES);
     uint8_t *spk_opus = malloc((size_t)out_sz);
     uint8_t *mic_opus = malloc(384);
     uint8_t *mic_pcm = malloc(MONO_PCM_BYTES);
     size_t spk_acc = 0;
 
-    ESP_LOGI(TAG, "Core 1 Opus Audio Bridge ready (enc=%dB->%dB, dec=48kHz mono)", in_sz, out_sz);
+    ESP_LOGI(TAG, "Core 1 Opus Audio Bridge ready (enc=1ch %dB->%dB, dec=48kHz mono)", in_sz, out_sz);
 
     TickType_t last_wake = xTaskGetTickCount();
     uint32_t slot = 0;
@@ -310,9 +311,9 @@ static void audio_duplex_task(void *arg)
             if (s_spk_primed) {
                 int sent_this_tick = 0;
                 while (sent_this_tick < 2) {
-                    while (spk_acc < (size_t)in_sz) {
+                    while (spk_acc < STEREO_PCM_BYTES) {
                         size_t got = 0;
-                        uint8_t *item = xRingbufferReceiveUpTo(s_spk_rb, &got, 0, (size_t)in_sz - spk_acc);
+                        uint8_t *item = xRingbufferReceiveUpTo(s_spk_rb, &got, 0, STEREO_PCM_BYTES - spk_acc);
                         if (!item || got == 0) {
                             break;
                         }
@@ -320,7 +321,7 @@ static void audio_duplex_task(void *arg)
                         vRingbufferReturnItem(s_spk_rb, item);
                         spk_acc += got;
                     }
-                    if (spk_acc < (size_t)in_sz) {
+                    if (spk_acc < STEREO_PCM_BYTES) {
                         if (spk_acc == 0 && sent_this_tick == 0) {
                             s_spk_primed = false;
                         }
@@ -328,7 +329,11 @@ static void audio_duplex_task(void *arg)
                     }
                     spk_acc = 0;
                     if (rtc_endpoint_is_srtp_ready()) {
-                        esp_audio_enc_in_frame_t inf = {.buffer = spk_pcm, .len = (uint32_t)in_sz};
+                        const int16_t *st = (const int16_t *)spk_pcm;
+                        for (int i = 0; i < FRAME_SAMPLES; i++) {
+                            spk_mono[i] = (int16_t)(((int32_t)st[2 * i] + (int32_t)st[2 * i + 1]) >> 1);
+                        }
+                        esp_audio_enc_in_frame_t inf = {.buffer = (uint8_t *)spk_mono, .len = MONO_PCM_BYTES};
                         esp_audio_enc_out_frame_t outf = {.buffer = spk_opus, .len = (uint32_t)out_sz};
                         int64_t t0 = esp_timer_get_time();
                         esp_audio_err_t eerr = esp_opus_enc_process(enc_hd, &inf, &outf);
