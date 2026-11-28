@@ -7,7 +7,7 @@
 #include <string.h>
 
 #include "esp_log.h"
-#include "esp_rom_crc.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -29,11 +29,16 @@ extern const uint8_t gts_privkey_pem_end[]     asm("_binary_gts_privkey_pem_end"
 #define STUN_MAGIC          0x2112A442U
 #define STUN_BINDING_REQ    0x0001
 #define STUN_BINDING_OK     0x0101
+#define STUN_ATTR_USERNAME  0x0006
 #define STUN_ATTR_MI        0x0008
 #define STUN_ATTR_XORMAPPED 0x0020
+#define STUN_ATTR_PRIORITY  0x0024
 #define STUN_ATTR_FP        0x8028
+#define STUN_ATTR_ICE_CTLD  0x8029
 
+#define LOCAL_ICE_UFRAG     "stadia1"
 #define LOCAL_ICE_PWD       "stadiacast_ice_password_123456"
+#define HOST_CAND_PRIORITY  2130706431U
 
 #define DTLS_RX_Q_CAP       16
 #define WIRE_TX_Q_CAP       16
@@ -156,6 +161,93 @@ static bool compute_hmac_sha1(const uint8_t *key, size_t key_len,
     return st == PSA_SUCCESS && mac_len == 20;
 }
 
+static uint32_t ieee_crc32(const uint8_t *buf, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFFU;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= buf[i];
+        for (int b = 0; b < 8; b++) {
+            crc = (crc >> 1) ^ (0xEDB88320U & (uint32_t)(-(int32_t)(crc & 1U)));
+        }
+    }
+    return ~crc;
+}
+
+static size_t stun_append_attr(uint8_t *buf, size_t off, uint16_t type, const void *val, uint16_t vlen)
+{
+    buf[off + 0] = (type >> 8) & 0xFF;
+    buf[off + 1] = type & 0xFF;
+    buf[off + 2] = (vlen >> 8) & 0xFF;
+    buf[off + 3] = vlen & 0xFF;
+    if (vlen > 0 && val) {
+        memcpy(buf + off + 4, val, vlen);
+    }
+    size_t pad = (4 - (vlen % 4)) % 4;
+    if (pad > 0) {
+        memset(buf + off + 4 + vlen, 0, pad);
+    }
+    return off + 4 + vlen + pad;
+}
+
+static void send_stun_binding_request(const struct sockaddr_in *to)
+{
+    stadia_remote_rtc_info_t remote;
+    if (!session_signaling_get_remote_rtc(&remote) || !remote.valid || !remote.ice_password[0]) {
+        return;
+    }
+
+    uint8_t req[128];
+    memset(req, 0, sizeof(req));
+    req[0] = (STUN_BINDING_REQ >> 8) & 0xFF;
+    req[1] = STUN_BINDING_REQ & 0xFF;
+    req[4] = (STUN_MAGIC >> 24) & 0xFF;
+    req[5] = (STUN_MAGIC >> 16) & 0xFF;
+    req[6] = (STUN_MAGIC >> 8) & 0xFF;
+    req[7] = STUN_MAGIC & 0xFF;
+    esp_fill_random(req + 8, 12);
+
+    size_t off = 20;
+    char uname[32];
+    int ulen = snprintf(uname, sizeof(uname), "%s:%s", remote.ice_ufrag, LOCAL_ICE_UFRAG);
+    off = stun_append_attr(req, off, STUN_ATTR_USERNAME, uname, (uint16_t)ulen);
+
+    uint8_t prio[4] = {
+        (HOST_CAND_PRIORITY >> 24) & 0xFF,
+        (HOST_CAND_PRIORITY >> 16) & 0xFF,
+        (HOST_CAND_PRIORITY >> 8) & 0xFF,
+        HOST_CAND_PRIORITY & 0xFF,
+    };
+    off = stun_append_attr(req, off, STUN_ATTR_PRIORITY, prio, 4);
+
+    uint8_t tie[8] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+    off = stun_append_attr(req, off, STUN_ATTR_ICE_CTLD, tie, 8);
+
+    uint16_t len_mi = (uint16_t)(off - 20 + 24);
+    req[2] = (len_mi >> 8) & 0xFF;
+    req[3] = len_mi & 0xFF;
+
+    uint8_t mac[20] = {0};
+    compute_hmac_sha1((const uint8_t *)remote.ice_password, strlen(remote.ice_password), req, off, mac);
+    off = stun_append_attr(req, off, STUN_ATTR_MI, mac, 20);
+
+    uint16_t len_total = (uint16_t)(off - 20 + 8);
+    req[2] = (len_total >> 8) & 0xFF;
+    req[3] = len_total & 0xFF;
+
+    uint32_t crc = ieee_crc32(req, off) ^ 0x5354554EU;
+    uint8_t fp_bytes[4] = {
+        (crc >> 24) & 0xFF,
+        (crc >> 16) & 0xFF,
+        (crc >> 8) & 0xFF,
+        crc & 0xFF,
+    };
+    off = stun_append_attr(req, off, STUN_ATTR_FP, fp_bytes, 4);
+
+    sendto(s_udp_fd, req, off, 0, (const struct sockaddr *)to, sizeof(*to));
+    ESP_LOGI(TAG, "Sent STUN Binding Request (%zuB) to %s:%u",
+             off, inet_ntoa(to->sin_addr), ntohs(to->sin_port));
+}
+
 static void handle_stun_packet(const uint8_t *pkt, size_t len, const struct sockaddr_in *from)
 {
     if (len < 20) return;
@@ -163,15 +255,22 @@ static void handle_stun_packet(const uint8_t *pkt, size_t len, const struct sock
     uint32_t magic = (uint32_t)((pkt[4] << 24) | (pkt[5] << 16) | (pkt[6] << 8) | pkt[7]);
     if (magic != STUN_MAGIC) return;
 
+    if (msg_type == STUN_BINDING_OK) {
+        ESP_LOGI(TAG, ">>> STUN Binding Success RX from %s:%u <<<",
+                 inet_ntoa(from->sin_addr), ntohs(from->sin_port));
+        return;
+    }
     if (msg_type != STUN_BINDING_REQ) {
         return;
     }
 
+    bool first_peer = false;
     if (!s_has_peer ||
         s_peer_addr.sin_addr.s_addr != from->sin_addr.s_addr ||
         s_peer_addr.sin_port != from->sin_port) {
         s_peer_addr = *from;
         s_has_peer = true;
+        first_peer = true;
         ESP_LOGI(TAG, ">>> ICE peer bound: %s:%u <<<",
                  inet_ntoa(from->sin_addr), ntohs(from->sin_port));
     }
@@ -192,50 +291,44 @@ static void handle_stun_packet(const uint8_t *pkt, size_t len, const struct sock
 
     // XOR-MAPPED-ADDRESS (0x0020, len=8)
     size_t off = 20;
-    resp[off + 0] = (STUN_ATTR_XORMAPPED >> 8) & 0xFF;
-    resp[off + 1] = STUN_ATTR_XORMAPPED & 0xFF;
-    resp[off + 2] = 0;
-    resp[off + 3] = 8;
-    resp[off + 4] = 0;
-    resp[off + 5] = 0x01; // IPv4
+    uint8_t xaddr[8];
+    xaddr[0] = 0;
+    xaddr[1] = 0x01; // IPv4
     uint16_t xport = ntohs(from->sin_port) ^ (uint16_t)(STUN_MAGIC >> 16);
-    resp[off + 6] = (xport >> 8) & 0xFF;
-    resp[off + 7] = xport & 0xFF;
+    xaddr[2] = (xport >> 8) & 0xFF;
+    xaddr[3] = xport & 0xFF;
     uint32_t ip_host = ntohl(from->sin_addr.s_addr);
     uint32_t xip = ip_host ^ STUN_MAGIC;
-    resp[off + 8]  = (xip >> 24) & 0xFF;
-    resp[off + 9]  = (xip >> 16) & 0xFF;
-    resp[off + 10] = (xip >> 8) & 0xFF;
-    resp[off + 11] = xip & 0xFF;
-    off += 12;
+    xaddr[4] = (xip >> 24) & 0xFF;
+    xaddr[5] = (xip >> 16) & 0xFF;
+    xaddr[6] = (xip >> 8) & 0xFF;
+    xaddr[7] = xip & 0xFF;
+    off = stun_append_attr(resp, off, STUN_ATTR_XORMAPPED, xaddr, 8);
 
     // MESSAGE-INTEGRITY (0x0008, len=20)
     uint8_t mac[20] = {0};
     compute_hmac_sha1((const uint8_t *)LOCAL_ICE_PWD, strlen(LOCAL_ICE_PWD), resp, off, mac);
-    resp[off + 0] = (STUN_ATTR_MI >> 8) & 0xFF;
-    resp[off + 1] = STUN_ATTR_MI & 0xFF;
-    resp[off + 2] = 0;
-    resp[off + 3] = 20;
-    memcpy(resp + off + 4, mac, 20);
-    off += 24;
+    off = stun_append_attr(resp, off, STUN_ATTR_MI, mac, 20);
 
     // Update header length to include FINGERPRINT (+8 = 44)
     uint16_t len_total = 44;
     resp[2] = (len_total >> 8) & 0xFF;
     resp[3] = len_total & 0xFF;
 
-    uint32_t crc = esp_rom_crc32_le(0, resp, (uint32_t)off) ^ 0x5354554EU;
-    resp[off + 0] = (STUN_ATTR_FP >> 8) & 0xFF;
-    resp[off + 1] = STUN_ATTR_FP & 0xFF;
-    resp[off + 2] = 0;
-    resp[off + 3] = 4;
-    resp[off + 4] = (crc >> 24) & 0xFF;
-    resp[off + 5] = (crc >> 16) & 0xFF;
-    resp[off + 6] = (crc >> 8) & 0xFF;
-    resp[off + 7] = crc & 0xFF;
-    off += 8;
+    uint32_t crc = ieee_crc32(resp, off) ^ 0x5354554EU;
+    uint8_t fp_bytes[4] = {
+        (crc >> 24) & 0xFF,
+        (crc >> 16) & 0xFF,
+        (crc >> 8) & 0xFF,
+        crc & 0xFF,
+    };
+    off = stun_append_attr(resp, off, STUN_ATTR_FP, fp_bytes, 4);
 
     sendto(s_udp_fd, resp, off, 0, (const struct sockaddr *)from, sizeof(*from));
+
+    if (first_peer) {
+        send_stun_binding_request(from);
+    }
 }
 
 static void handle_wire_record(const uint8_t *rec, size_t len)
