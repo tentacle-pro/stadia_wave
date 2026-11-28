@@ -95,19 +95,24 @@ static void send_http_response(mbedtls_ssl_context *ssl, int status, const char 
 
 static void handle_http_requests(mbedtls_ssl_context *ssl, const char *sni)
 {
-    char req_buf[4096];
+    const size_t req_buf_sz = 16384;
+    char *req_buf = malloc(req_buf_sz);
+    if (!req_buf) {
+        return;
+    }
     while (1) {
         int total = 0;
         char *hdr_end = NULL;
-        while (total < (int)sizeof(req_buf) - 1) {
+        while (total < (int)req_buf_sz - 1) {
             int r = mbedtls_ssl_read(ssl, (unsigned char *)req_buf + total,
-                                     sizeof(req_buf) - 1 - (size_t)total);
+                                     req_buf_sz - 1 - (size_t)total);
             if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE) {
                 continue;
             }
             if (r <= 0) {
                 ESP_LOGI(TAG, "HTTPS conn (%s) closed/timeout: r=%d (-0x%04x), total=%d",
                          sni, r, r < 0 ? -r : 0, total);
+                free(req_buf);
                 return;
             }
             total += r;
@@ -119,6 +124,7 @@ static void handle_http_requests(mbedtls_ssl_context *ssl, const char *sni)
         }
         if (!hdr_end) {
             ESP_LOGW(TAG, "HTTPS header incomplete/too large (%s): total=%d", sni, total);
+            free(req_buf);
             return;
         }
 
@@ -141,6 +147,7 @@ static void handle_http_requests(mbedtls_ssl_context *ssl, const char *sni)
             int r = mbedtls_ssl_read(ssl, drain, (size_t)to_read);
             if (r <= 0) {
                 if (r == MBEDTLS_ERR_SSL_WANT_READ) continue;
+                free(req_buf);
                 return;
             }
             remaining -= r;
