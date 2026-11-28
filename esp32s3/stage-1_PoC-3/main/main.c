@@ -24,7 +24,9 @@ void app_main(void)
              esp_psram_is_initialized() ? esp_psram_get_size() : 0);
 
     // 1. Verify DTLS 1.2 + use_srtp key export locally first
-    ESP_ERROR_CHECK(dtls_srtp_run_selftest());
+    if (dtls_srtp_run_selftest() != ESP_OK) {
+        ESP_LOGE(TAG, "DTLS-SRTP self-test failed (continuing to HTTPS/SNI test)");
+    }
 
     // 2. Start SoftAP + DNS Sink + SNTP + GTS HTTPS Server with SNI Clearcut block
     ESP_ERROR_CHECK(wifi_ap_init());

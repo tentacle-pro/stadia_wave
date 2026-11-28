@@ -138,12 +138,27 @@ esp_err_t dtls_srtp_run_selftest(void)
     mbedtls_ssl_init(&srv_ssl);
     mbedtls_ssl_init(&cli_ssl);
 
+    dgram_queue_t *q_c2s = NULL;
+    dgram_queue_t *q_s2c = NULL;
     int ret = mbedtls_x509_crt_parse(&srvcert, gts_fullchain_pem_start,
                                      (size_t)(gts_fullchain_pem_end - gts_fullchain_pem_start));
-    if (ret != 0) goto fail;
+    if (ret != 0) {
+        ESP_LOGE(TAG, "mbedtls_x509_crt_parse failed: -0x%04x", -ret);
+        goto fail;
+    }
     ret = mbedtls_pk_parse_key(&pkey, gts_privkey_pem_start,
                                (size_t)(gts_privkey_pem_end - gts_privkey_pem_start), NULL, 0);
-    if (ret != 0) goto fail;
+    if (ret != 0) {
+        ESP_LOGE(TAG, "mbedtls_pk_parse_key failed: -0x%04x", -ret);
+        goto fail;
+    }
+
+    q_c2s = calloc(1, sizeof(dgram_queue_t));
+    q_s2c = calloc(1, sizeof(dgram_queue_t));
+    if (!q_c2s || !q_s2c) {
+        ESP_LOGE(TAG, "Failed to allocate dgram queues");
+        goto fail;
+    }
 
     // Server config (DTLS + SRTP, disable cookie verification for stateless loopback test)
     mbedtls_ssl_config_defaults(&srv_conf, MBEDTLS_SSL_IS_SERVER,
@@ -162,9 +177,8 @@ esp_err_t dtls_srtp_run_selftest(void)
     mbedtls_ssl_setup(&srv_ssl, &srv_conf);
     mbedtls_ssl_setup(&cli_ssl, &cli_conf);
 
-    dgram_queue_t q_c2s = {0}, q_s2c = {0};
-    mem_bio_t srv_bio = {.rx = &q_c2s, .tx = &q_s2c};
-    mem_bio_t cli_bio = {.rx = &q_s2c, .tx = &q_c2s};
+    mem_bio_t srv_bio = {.rx = q_c2s, .tx = q_s2c};
+    mem_bio_t cli_bio = {.rx = q_s2c, .tx = q_c2s};
     dtls_timer_t srv_timer = {0}, cli_timer = {0};
     srtp_export_t srv_exp = {0}, cli_exp = {0};
 
@@ -211,6 +225,8 @@ esp_err_t dtls_srtp_run_selftest(void)
              (int)srtp_info.MBEDTLS_PRIVATE(chosen_dtls_srtp_profile),
              srv_exp.material[0], srv_exp.material[1], srv_exp.material[2], srv_exp.material[3]);
 
+    free(q_c2s);
+    free(q_s2c);
     mbedtls_ssl_free(&srv_ssl);
     mbedtls_ssl_free(&cli_ssl);
     mbedtls_ssl_config_free(&srv_conf);
@@ -220,6 +236,8 @@ esp_err_t dtls_srtp_run_selftest(void)
     return ESP_OK;
 
 fail:
+    free(q_c2s);
+    free(q_s2c);
     mbedtls_ssl_free(&srv_ssl);
     mbedtls_ssl_free(&cli_ssl);
     mbedtls_ssl_config_free(&srv_conf);
