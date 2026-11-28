@@ -83,6 +83,9 @@ static uint8_t map_dpad_hat(uint32_t btn)
 }
 
 static volatile uint32_t s_hid_in_updates = 0;
+static volatile uint32_t s_hid_done_cnt = 0;
+static volatile uint32_t s_hid_get_rep_cnt = 0;
+static volatile int64_t s_usb_mounted_us = 0;
 
 void usb_bridge_update_input(const stadia_controller_input_t *in)
 {
@@ -134,18 +137,29 @@ void usb_bridge_set_rumble_cb(usb_rumble_cb_t cb)
 
 void tud_mount_cb(void)
 {
+    s_usb_mounted_us = esp_timer_get_time();
     ESP_LOGI(TAG, "USB Mounted on host (DS4 HID + UAC 2.0)");
 }
 
 void tud_umount_cb(void)
 {
+    s_usb_mounted_us = 0;
     ESP_LOGI(TAG, "USB Unmounted");
+}
+
+void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_t len)
+{
+    (void)instance;
+    (void)report;
+    (void)len;
+    s_hid_done_cnt++;
 }
 
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type,
                                uint8_t *buffer, uint16_t reqlen)
 {
     (void)instance;
+    s_hid_get_rep_cnt++;
     if (report_type != HID_REPORT_TYPE_FEATURE) return 0;
 
     if (report_id == 0x02 && reqlen >= 36) {
@@ -237,7 +251,9 @@ static void usb_hid_task(void *arg)
     uint32_t ticks = 0;
 
     while (1) {
-        if (tud_mounted() && tud_hid_ready()) {
+        bool allow_hid = tud_mounted() && s_usb_mounted_us > 0 &&
+                         (esp_timer_get_time() - s_usb_mounted_us >= 2000000);
+        if (allow_hid && tud_hid_ready()) {
             ds4_input_report_t out;
             portENTER_CRITICAL(&s_lock);
             out = s_report;
@@ -260,10 +276,12 @@ static void usb_hid_task(void *arg)
 
         if (++ticks >= 500) {
             ticks = 0;
-            ESP_LOGI(TAG, "HID 5s: sent=%lu, updates=%lu, mounted=%d, ready=%d",
-                     (unsigned long)sent_5s, (unsigned long)s_hid_in_updates,
+            ESP_LOGI(TAG, "HID 5s: sent=%lu, done=%lu, get_rep=%lu, updates=%lu, mounted=%d, ready=%d",
+                     (unsigned long)sent_5s, (unsigned long)s_hid_done_cnt,
+                     (unsigned long)s_hid_get_rep_cnt, (unsigned long)s_hid_in_updates,
                      tud_mounted(), tud_hid_ready());
             sent_5s = 0;
+            s_hid_done_cnt = 0;
             s_hid_in_updates = 0;
         }
 
