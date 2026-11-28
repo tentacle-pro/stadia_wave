@@ -340,6 +340,10 @@ static bool gatt_read_long_sync(uint16_t handle, size_t *out_len)
 //--------------------------------------------------------------------+
 static char *decompress_window_payload(const uint8_t *raw, size_t raw_len, size_t *out_len)
 {
+    if (raw_len >= 16) {
+        ESP_LOGI(TAG, "Window 1a head: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+                 raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9]);
+    }
     if (raw_len < 18 || raw[0] != 0x1F || raw[1] != 0x8B || raw[2] != 0x08) {
         // Not gzip; return null-terminated copy as-is
         char *plain = malloc(raw_len + 1);
@@ -374,19 +378,21 @@ static char *decompress_window_payload(const uint8_t *raw, size_t raw_len, size_
     }
 
     size_t deflate_len = raw_len - pos - 8;
-    size_t dec_len = 0;
-    void *dec = tinfl_decompress_mem_to_heap(raw + pos, deflate_len, &dec_len, 0);
-    if (!dec) {
+    const size_t max_out = 32768;
+    char *out_buf = malloc(max_out + 1);
+    if (!out_buf) {
         return NULL;
     }
-    char *json_str = realloc(dec, dec_len + 1);
-    if (!json_str) {
-        free(dec);
+    size_t dec_len = tinfl_decompress_mem_to_mem(
+        out_buf, max_out, raw + pos, deflate_len, TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+    if (dec_len == TINFL_DECOMPRESS_MEM_TO_MEM_FAILED) {
+        free(out_buf);
         return NULL;
     }
-    json_str[dec_len] = '\0';
+    out_buf[dec_len] = '\0';
     *out_len = dec_len;
-    return json_str;
+    ESP_LOGI(TAG, "Decompressed Crypto Window 1a: %u -> %u bytes", (unsigned)raw_len, (unsigned)dec_len);
+    return out_buf;
 }
 
 //--------------------------------------------------------------------+
@@ -646,7 +652,7 @@ esp_err_t ble_provisioner_init(void)
     ble_att_set_preferred_mtu(517);
 
     nimble_port_freertos_init(nimble_host_task);
-    xTaskCreatePinnedToCore(provision_task, "ble_prov", 8192, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(provision_task, "ble_prov", 24576, NULL, 5, NULL, 0);
     return ESP_OK;
 }
 
