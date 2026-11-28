@@ -138,7 +138,7 @@ uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 #define EPNUM_AUDIO_OUT   0x01
 #define EPNUM_AUDIO_FB    0x81
 #define EPNUM_AUDIO_IN    0x82
-#define EPNUM_HID_OUT     0x02
+#define EPNUM_HID_OUT     0x03
 #define EPNUM_HID_IN      0x83
 
 #define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_AUDIO_DEVICE_DESC_LEN + TUD_HID_INOUT_DESC_LEN)
