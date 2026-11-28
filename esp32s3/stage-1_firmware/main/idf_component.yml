@@ -1,0 +1,7 @@
+## IDF Component Manager Manifest File
+dependencies:
+  espressif/cjson: "*"
+  espressif/esp_audio_codec: "*"
+  espressif/usb_device_uac: "*"
+  nikas-belogolov/nanopb: "*"
+  idf: ">=6.0"
