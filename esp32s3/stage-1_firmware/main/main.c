@@ -4,6 +4,7 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_psram.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "game_session.h"
@@ -68,5 +69,6 @@ void app_main(void)
 
     xTaskCreatePinnedToCore(boot_button_task, "boot_btn", 3072, NULL, 3, NULL, 0);
 
-    ESP_LOGI(TAG, "Gateway + Signaling + BLE Provisioner ready (SoftAP='%s')", STADIA_SOFTAP_SSID);
+    ESP_LOGI(TAG, "Gateway + Signaling + BLE Provisioner ready (SoftAP='%s', free_int=%luB)",
+             STADIA_SOFTAP_SSID, (unsigned long)esp_get_free_internal_heap_size());
 }
