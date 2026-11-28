@@ -324,8 +324,10 @@ static void handle_controller_to_display_resp(uint32_t ticket, gotham_rpc_Status
             ESP_LOGI(TAG, ">>> MILESTONE: Display Link READY! <<<");
             ESP_LOGI(TAG, "  HW: mfg='%s', prod='%s', hw='%s', fw='%s', serial='%s', headset=%d",
                      mfg, prod, hw, fw, serial, s_last_input.headset_plugged);
-            ESP_LOGI(TAG, "Sending StartGame to enable GameSession & Rumble...");
+            ESP_LOGI(TAG, "Sending StartGame + AudioMode(2) + SetMic(true)...");
             display_rpc_send_start_game("stadia-wave-01");
+            display_rpc_send_set_audio_mode(2, true);
+            display_rpc_send_set_microphone(true);
         }
         free(st);
     } else {

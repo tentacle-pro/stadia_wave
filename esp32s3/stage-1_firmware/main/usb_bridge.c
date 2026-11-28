@@ -1,16 +1,28 @@
 #include "usb_bridge.h"
+#include "rtc_endpoint.h"
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
+#include "esp_audio_dec.h"
+#include "esp_audio_enc.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/ringbuf.h"
 #include "freertos/task.h"
+#include "impl/esp_opus_dec.h"
+#include "impl/esp_opus_enc.h"
 #include "tusb.h"
 #include "usb_descriptors.h"
 #include "usb_device_uac.h"
 
 static const char *TAG = "usb_bridge";
+
+#define SAMPLE_RATE_HZ   48000
+#define FRAME_SAMPLES    960
+#define MONO_PCM_BYTES   (FRAME_SAMPLES * 2)
+#define STEREO_PCM_BYTES (FRAME_SAMPLES * 4)
 
 typedef struct __attribute__((packed)) {
     uint8_t lx;
@@ -39,6 +51,9 @@ static usb_rumble_cb_t s_rumble_cb = NULL;
 static volatile uint8_t s_rumble_left = 0;
 static volatile uint8_t s_rumble_right = 0;
 static volatile bool s_rumble_dirty = false;
+
+static RingbufHandle_t s_spk_rb = NULL;
+static RingbufHandle_t s_mic_rb = NULL;
 
 static uint8_t map_dpad_hat(uint32_t btn)
 {
@@ -167,16 +182,27 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
 
 static esp_err_t uac_output_cb(uint8_t *buf, size_t len, void *cb_ctx)
 {
-    (void)buf;
-    (void)len;
     (void)cb_ctx;
+    if (s_spk_rb && len > 0) {
+        xRingbufferSend(s_spk_rb, buf, len, 0);
+    }
     return ESP_OK;
 }
 
 static esp_err_t uac_input_cb(uint8_t *buf, size_t len, size_t *bytes_read, void *cb_ctx)
 {
     (void)cb_ctx;
-    memset(buf, 0, len);
+    size_t got = 0;
+    if (s_mic_rb) {
+        uint8_t *item = xRingbufferReceiveUpTo(s_mic_rb, &got, 0, len);
+        if (item) {
+            memcpy(buf, item, got);
+            vRingbufferReturnItem(s_mic_rb, item);
+        }
+    }
+    if (got < len) {
+        memset(buf + got, 0, len - got);
+    }
     *bytes_read = len;
     return ESP_OK;
 }
@@ -203,8 +229,6 @@ static void usb_hid_task(void *arg)
             uint8_t r = s_rumble_right;
             if (s_rumble_cb) {
                 s_rumble_cb(l, r);
-            } else {
-                ESP_LOGI(TAG, "Host Rumble -> L=%u, R=%u", l, r);
             }
         }
 
@@ -212,8 +236,95 @@ static void usb_hid_task(void *arg)
     }
 }
 
+static void audio_duplex_task(void *arg)
+{
+    (void)arg;
+
+    void *enc_hd = NULL;
+    void *dec_hd = NULL;
+    esp_opus_enc_config_t enc_cfg = {
+        .sample_rate = SAMPLE_RATE_HZ,
+        .channel = 2,
+        .bits_per_sample = 16,
+        .bitrate = 64000,
+        .frame_duration = ESP_OPUS_ENC_FRAME_DURATION_20_MS,
+        .application_mode = ESP_OPUS_ENC_APPLICATION_LOWDELAY,
+        .complexity = 0,
+        .enable_fec = false,
+        .enable_dtx = false,
+        .enable_vbr = false,
+    };
+    esp_opus_dec_cfg_t dec_cfg = {
+        .sample_rate = SAMPLE_RATE_HZ,
+        .channel = 1,
+        .frame_duration = ESP_OPUS_DEC_FRAME_DURATION_20_MS,
+        .self_delimited = false,
+    };
+
+    if (esp_opus_enc_open(&enc_cfg, sizeof(enc_cfg), &enc_hd) != ESP_AUDIO_ERR_OK ||
+        esp_opus_dec_open(&dec_cfg, sizeof(dec_cfg), &dec_hd) != ESP_AUDIO_ERR_OK) {
+        ESP_LOGE(TAG, "Failed to open Opus encoder/decoder");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int in_sz = 0, out_sz = 0;
+    esp_opus_enc_get_frame_size(enc_hd, &in_sz, &out_sz);
+    uint8_t *spk_pcm = malloc((size_t)in_sz);
+    uint8_t *spk_opus = malloc((size_t)out_sz);
+    uint8_t *mic_opus = malloc(384);
+    uint8_t *mic_pcm = malloc(MONO_PCM_BYTES);
+
+    ESP_LOGI(TAG, "Core 1 Opus Audio Bridge ready (enc=%dB->%dB, dec=48kHz mono)", in_sz, out_sz);
+
+    TickType_t last_wake = xTaskGetTickCount();
+    uint32_t slot = 0;
+
+    while (1) {
+        // 1. Headset TX: UAC Speaker (48kHz stereo) -> Opus Enc -> SRTP
+        if (s_spk_rb && rtc_endpoint_is_srtp_ready()) {
+            size_t got = 0;
+            uint8_t *item = xRingbufferReceiveUpTo(s_spk_rb, &got, 0, (size_t)in_sz);
+            if (item) {
+                if (got == (size_t)in_sz) {
+                    memcpy(spk_pcm, item, got);
+                    vRingbufferReturnItem(s_spk_rb, item);
+                    esp_audio_enc_in_frame_t inf = {.buffer = spk_pcm, .len = (uint32_t)in_sz};
+                    esp_audio_enc_out_frame_t outf = {.buffer = spk_opus, .len = (uint32_t)out_sz};
+                    if (esp_opus_enc_process(enc_hd, &inf, &outf) == ESP_AUDIO_ERR_OK &&
+                        outf.encoded_bytes > 0) {
+                        rtc_endpoint_send_audio_opus(spk_opus, outf.encoded_bytes, slot * FRAME_SAMPLES);
+                    }
+                } else {
+                    vRingbufferReturnItem(s_spk_rb, item);
+                }
+            }
+        }
+
+        // 2. Mic RX: SRTP -> Opus Dec -> UAC Mic (48kHz mono)
+        size_t mop_len = 0;
+        while (rtc_endpoint_recv_mic_opus(mic_opus, 384, &mop_len)) {
+            esp_audio_dec_in_raw_t raw = {.buffer = mic_opus, .len = (uint32_t)mop_len};
+            esp_audio_dec_out_frame_t decf = {.buffer = mic_pcm, .len = MONO_PCM_BYTES};
+            esp_audio_dec_info_t info = {0};
+            if (esp_opus_dec_decode(dec_hd, &raw, &decf, &info) == ESP_AUDIO_ERR_OK && s_mic_rb) {
+                xRingbufferSend(s_mic_rb, mic_pcm, MONO_PCM_BYTES, 0);
+            }
+        }
+
+        slot++;
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(20));
+    }
+}
+
 esp_err_t usb_bridge_init(void)
 {
+    s_spk_rb = xRingbufferCreate(STEREO_PCM_BYTES * 6, RINGBUF_TYPE_BYTEBUF);
+    s_mic_rb = xRingbufferCreate(MONO_PCM_BYTES * 6, RINGBUF_TYPE_BYTEBUF);
+    if (!s_spk_rb || !s_mic_rb) {
+        return ESP_ERR_NO_MEM;
+    }
+
     uac_device_config_t uac_cfg = {
         .skip_tinyusb_init = false,
         .output_cb = uac_output_cb,
@@ -229,7 +340,8 @@ esp_err_t usb_bridge_init(void)
         return ret;
     }
 
-    xTaskCreatePinnedToCore(usb_hid_task, "usb_hid", 4096, NULL, 5, NULL, 1);
-    ESP_LOGI(TAG, "USB Bridge initialized (DualShock 4 HID + UAC 2.0)");
+    xTaskCreatePinnedToCore(usb_hid_task, "usb_hid", 3072, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(audio_duplex_task, "opus_duplex", 40960, NULL, 6, NULL, 1);
+    ESP_LOGI(TAG, "USB Bridge initialized (DS4 HID + UAC 2.0 + Core 1 Opus)");
     return ESP_OK;
 }

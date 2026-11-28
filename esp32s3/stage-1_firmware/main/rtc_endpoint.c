@@ -42,12 +42,19 @@ extern const uint8_t gts_privkey_pem_end[]     asm("_binary_gts_privkey_pem_end"
 
 #define DTLS_RX_Q_CAP       16
 #define WIRE_TX_Q_CAP       16
+#define MIC_OPUS_Q_CAP      16
 #define WIRE_MAX_PAYLOAD    1400
+#define LOCAL_AUDIO_SSRC    0x11223344U
 
 typedef struct {
     uint8_t data[1500];
     size_t len;
 } dgram_pkt_t;
+
+typedef struct {
+    uint16_t len;
+    uint8_t data[384];
+} mic_opus_item_t;
 
 typedef struct {
     uint16_t msg_id;
@@ -61,12 +68,29 @@ typedef struct {
     int64_t start_us;
 } dtls_timer_t;
 
+typedef struct {
+    bool ready;
+    uint8_t rx_key[16];
+    uint8_t rx_auth[20];
+    uint8_t rx_salt[14];
+    uint32_t rx_roc;
+    uint16_t rx_s_l;
+    bool rx_seen;
+    uint8_t tx_key[16];
+    uint8_t tx_auth[20];
+    uint8_t tx_salt[14];
+    uint32_t tx_roc;
+    uint16_t tx_seq;
+} srtp_state_t;
+
 static int s_udp_fd = -1;
 static struct sockaddr_in s_peer_addr;
 static bool s_has_peer = false;
-static bool s_dtls_connected = false;
+static volatile bool s_dtls_connected = false;
 static rtc_wire_rx_cb_t s_wire_rx_cb = NULL;
 static QueueHandle_t s_wire_tx_q = NULL;
+static QueueHandle_t s_mic_opus_q = NULL;
+static srtp_state_t s_srtp = {0};
 
 static dgram_pkt_t *s_dtls_rx_q = NULL;
 static int s_rx_head = 0;
@@ -160,6 +184,164 @@ static bool compute_hmac_sha1(const uint8_t *key, size_t key_len,
                                       data, data_len, out_mac, 20, &mac_len);
     psa_destroy_key(key_id);
     return st == PSA_SUCCESS && mac_len == 20;
+}
+
+static bool aes_ctr_crypt(const uint8_t key[16], const uint8_t iv[16],
+                          const uint8_t *in, size_t len, uint8_t *out)
+{
+    if (len == 0) return true;
+    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_ENCRYPT | PSA_KEY_USAGE_DECRYPT);
+    psa_set_key_algorithm(&attr, PSA_ALG_CTR);
+    psa_set_key_type(&attr, PSA_KEY_TYPE_AES);
+    psa_set_key_bits(&attr, 128);
+
+    psa_key_id_t kid = 0;
+    if (psa_import_key(&attr, key, 16, &kid) != PSA_SUCCESS) {
+        return false;
+    }
+
+    psa_cipher_operation_t op = PSA_CIPHER_OPERATION_INIT;
+    bool ok = false;
+    size_t out_len = 0, fin_len = 0;
+    if (psa_cipher_encrypt_setup(&op, kid, PSA_ALG_CTR) == PSA_SUCCESS &&
+        psa_cipher_set_iv(&op, iv, 16) == PSA_SUCCESS &&
+        psa_cipher_update(&op, in, len, out, len, &out_len) == PSA_SUCCESS &&
+        psa_cipher_finish(&op, out + out_len, len - out_len, &fin_len) == PSA_SUCCESS) {
+        ok = true;
+    } else {
+        psa_cipher_abort(&op);
+    }
+    psa_destroy_key(kid);
+    return ok;
+}
+
+static void srtp_kdf(const uint8_t mkey[16], const uint8_t msalt[14],
+                     uint8_t label, uint8_t *out, size_t out_len)
+{
+    uint8_t iv[16] = {0};
+    memcpy(iv, msalt, 14);
+    iv[7] ^= label;
+    uint8_t zeros[32] = {0};
+    if (out_len <= sizeof(zeros)) {
+        aes_ctr_crypt(mkey, iv, zeros, out_len, out);
+    }
+}
+
+static void srtp_cm_iv(const uint8_t salt[14], uint32_t ssrc, uint32_t roc, uint16_t seq, uint8_t iv[16])
+{
+    memset(iv, 0, 16);
+    memcpy(iv, salt, 14);
+    iv[4] ^= (ssrc >> 24) & 0xFF;
+    iv[5] ^= (ssrc >> 16) & 0xFF;
+    iv[6] ^= (ssrc >> 8) & 0xFF;
+    iv[7] ^= ssrc & 0xFF;
+    iv[8] ^= (roc >> 24) & 0xFF;
+    iv[9] ^= (roc >> 16) & 0xFF;
+    iv[10] ^= (roc >> 8) & 0xFF;
+    iv[11] ^= roc & 0xFF;
+    iv[12] ^= (seq >> 8) & 0xFF;
+    iv[13] ^= seq & 0xFF;
+}
+
+static void dtls_export_keys_cb(void *p_expkey, mbedtls_ssl_key_export_type type,
+                                const unsigned char *secret, size_t secret_len,
+                                const unsigned char client_random[32],
+                                const unsigned char server_random[32],
+                                mbedtls_tls_prf_types tls_prf_type)
+{
+    (void)p_expkey;
+    (void)type;
+    uint8_t randbytes[64];
+    memcpy(randbytes, client_random, 32);
+    memcpy(randbytes + 32, server_random, 32);
+
+    uint8_t mat[60] = {0};
+    int ret = mbedtls_ssl_tls_prf(tls_prf_type, secret, secret_len,
+                                  "EXTRACTOR-dtls_srtp", randbytes, sizeof(randbytes),
+                                  mat, sizeof(mat));
+    if (ret != 0) {
+        ESP_LOGE(TAG, "SRTP PRF failed: -0x%04x", -ret);
+        return;
+    }
+
+    const uint8_t *cli_key  = mat + 0;
+    const uint8_t *srv_key  = mat + 16;
+    const uint8_t *cli_salt = mat + 32;
+    const uint8_t *srv_salt = mat + 46;
+
+    memset(&s_srtp, 0, sizeof(s_srtp));
+    srtp_kdf(cli_key, cli_salt, 0x00, s_srtp.rx_key, 16);
+    srtp_kdf(cli_key, cli_salt, 0x01, s_srtp.rx_auth, 20);
+    srtp_kdf(cli_key, cli_salt, 0x02, s_srtp.rx_salt, 14);
+    srtp_kdf(srv_key, srv_salt, 0x00, s_srtp.tx_key, 16);
+    srtp_kdf(srv_key, srv_salt, 0x01, s_srtp.tx_auth, 20);
+    srtp_kdf(srv_key, srv_salt, 0x02, s_srtp.tx_salt, 14);
+    s_srtp.ready = true;
+    ESP_LOGI(TAG, ">>> SRTP Keys Derived (AES-128-CM + HMAC-SHA1-80 Ready)! <<<");
+}
+
+static void handle_srtp_rx(uint8_t *pkt, size_t len)
+{
+    if (!s_srtp.ready || len < 12 + 10) return;
+    uint8_t pt = pkt[1] & 0x7F;
+    if (pkt[1] >= 192 && pkt[1] <= 223) return; // RTCP
+
+    uint8_t cc = pkt[0] & 0x0F;
+    size_t hdr_len = 12 + 4 * cc;
+    if (pkt[0] & 0x10) {
+        if (len < hdr_len + 4 + 10) return;
+        uint16_t ext_words = (uint16_t)((pkt[hdr_len + 2] << 8) | pkt[hdr_len + 3]);
+        hdr_len += 4 + 4 * ext_words;
+    }
+    if (hdr_len + 10 > len) return;
+
+    uint16_t seq = (uint16_t)((pkt[2] << 8) | pkt[3]);
+    uint32_t ssrc = (uint32_t)((pkt[8] << 24) | (pkt[9] << 16) | (pkt[10] << 8) | pkt[11]);
+
+    uint32_t roc = s_srtp.rx_roc;
+    if (s_srtp.rx_seen) {
+        if (s_srtp.rx_s_l < 32768 && seq - s_srtp.rx_s_l > 32768) roc--;
+        else if (s_srtp.rx_s_l >= 32768 && s_srtp.rx_s_l - 32768 > seq) roc++;
+    }
+
+    size_t body_len = len - 10;
+    uint8_t *auth_input = malloc(body_len + 4);
+    if (!auth_input) return;
+    memcpy(auth_input, pkt, body_len);
+    auth_input[body_len + 0] = (roc >> 24) & 0xFF;
+    auth_input[body_len + 1] = (roc >> 16) & 0xFF;
+    auth_input[body_len + 2] = (roc >> 8) & 0xFF;
+    auth_input[body_len + 3] = roc & 0xFF;
+
+    uint8_t mac[20] = {0};
+    bool mac_ok = compute_hmac_sha1(s_srtp.rx_auth, 20, auth_input, body_len + 4, mac) &&
+                  memcmp(mac, pkt + body_len, 10) == 0;
+    free(auth_input);
+    if (!mac_ok) {
+        ESP_LOGW(TAG, "SRTP auth failed (pt=%u, seq=%u)", pt, seq);
+        return;
+    }
+
+    size_t pay_len = body_len - hdr_len;
+    if (pay_len == 0 || pay_len > sizeof(((mic_opus_item_t *)0)->data)) return;
+
+    uint8_t iv[16];
+    srtp_cm_iv(s_srtp.rx_salt, ssrc, roc, seq, iv);
+    mic_opus_item_t *item = malloc(sizeof(mic_opus_item_t));
+    if (!item) return;
+    if (aes_ctr_crypt(s_srtp.rx_key, iv, pkt + hdr_len, pay_len, item->data)) {
+        if (!s_srtp.rx_seen || (roc == s_srtp.rx_roc && seq > s_srtp.rx_s_l) || roc == s_srtp.rx_roc + 1) {
+            s_srtp.rx_roc = roc;
+            s_srtp.rx_s_l = seq;
+            s_srtp.rx_seen = true;
+        }
+        item->len = (uint16_t)pay_len;
+        if (s_mic_opus_q) {
+            xQueueSend(s_mic_opus_q, item, 0);
+        }
+    }
+    free(item);
 }
 
 static uint32_t ieee_crc32(const uint8_t *buf, size_t len)
@@ -423,6 +605,7 @@ static void rtc_endpoint_task(void *arg)
     mbedtls_ssl_conf_dtls_srtp_protection_profiles(&conf, srtp_profiles);
 
     ESP_ERROR_CHECK(mbedtls_ssl_setup(&ssl, &conf));
+    mbedtls_ssl_set_export_keys_cb(&ssl, dtls_export_keys_cb, NULL);
     mbedtls_ssl_set_mtu(&ssl, 1200);
 
     dtls_timer_t timer = {0};
@@ -474,6 +657,8 @@ static void rtc_endpoint_task(void *arg)
                 }
                 dtls_started = true;
                 dtls_rx_push(rx_buf, (size_t)n);
+            } else if (b0 >= 128 && b0 <= 191) {
+                handle_srtp_rx(rx_buf, (size_t)n);
             } else {
                 ESP_LOGD(TAG, "UDP packet b0=%u, len=%d", b0, n);
             }
@@ -540,7 +725,8 @@ esp_err_t rtc_endpoint_start(void)
 {
     s_dtls_rx_q = calloc(DTLS_RX_Q_CAP, sizeof(dgram_pkt_t));
     s_wire_tx_q = xQueueCreate(WIRE_TX_Q_CAP, sizeof(wire_tx_item_t));
-    if (!s_dtls_rx_q || !s_wire_tx_q) {
+    s_mic_opus_q = xQueueCreate(MIC_OPUS_Q_CAP, sizeof(mic_opus_item_t));
+    if (!s_dtls_rx_q || !s_wire_tx_q || !s_mic_opus_q) {
         return ESP_ERR_NO_MEM;
     }
     xTaskCreatePinnedToCore(rtc_endpoint_task, "rtc_ep", 8192, NULL, 6, NULL, 0);
@@ -550,6 +736,79 @@ esp_err_t rtc_endpoint_start(void)
 bool rtc_endpoint_is_dtls_connected(void)
 {
     return s_dtls_connected;
+}
+
+bool rtc_endpoint_is_srtp_ready(void)
+{
+    return s_srtp.ready;
+}
+
+esp_err_t rtc_endpoint_send_audio_opus(const uint8_t *opus, size_t len, uint32_t timestamp)
+{
+    if (!s_srtp.ready || !s_has_peer || s_udp_fd < 0 || !opus || len == 0 || len > 1200) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint8_t *pkt = malloc(12 + len + 10 + 4);
+    if (!pkt) return ESP_ERR_NO_MEM;
+
+    uint16_t seq = s_srtp.tx_seq++;
+    if (s_srtp.tx_seq == 0) {
+        s_srtp.tx_roc++;
+    }
+
+    pkt[0] = 0x80;
+    pkt[1] = 111; // PT=111 Opus
+    pkt[2] = (seq >> 8) & 0xFF;
+    pkt[3] = seq & 0xFF;
+    pkt[4] = (timestamp >> 24) & 0xFF;
+    pkt[5] = (timestamp >> 16) & 0xFF;
+    pkt[6] = (timestamp >> 8) & 0xFF;
+    pkt[7] = timestamp & 0xFF;
+    pkt[8] = (LOCAL_AUDIO_SSRC >> 24) & 0xFF;
+    pkt[9] = (LOCAL_AUDIO_SSRC >> 16) & 0xFF;
+    pkt[10] = (LOCAL_AUDIO_SSRC >> 8) & 0xFF;
+    pkt[11] = LOCAL_AUDIO_SSRC & 0xFF;
+
+    uint8_t iv[16];
+    srtp_cm_iv(s_srtp.tx_salt, LOCAL_AUDIO_SSRC, s_srtp.tx_roc, seq, iv);
+    if (!aes_ctr_crypt(s_srtp.tx_key, iv, opus, len, pkt + 12)) {
+        free(pkt);
+        return ESP_FAIL;
+    }
+
+    size_t body_len = 12 + len;
+    pkt[body_len + 0] = (s_srtp.tx_roc >> 24) & 0xFF;
+    pkt[body_len + 1] = (s_srtp.tx_roc >> 16) & 0xFF;
+    pkt[body_len + 2] = (s_srtp.tx_roc >> 8) & 0xFF;
+    pkt[body_len + 3] = s_srtp.tx_roc & 0xFF;
+
+    uint8_t mac[20] = {0};
+    if (!compute_hmac_sha1(s_srtp.tx_auth, 20, pkt, body_len + 4, mac)) {
+        free(pkt);
+        return ESP_FAIL;
+    }
+    memcpy(pkt + body_len, mac, 10);
+
+    sendto(s_udp_fd, pkt, body_len + 10, 0, (struct sockaddr *)&s_peer_addr, sizeof(s_peer_addr));
+    free(pkt);
+    return ESP_OK;
+}
+
+bool rtc_endpoint_recv_mic_opus(uint8_t *out_buf, size_t max_len, size_t *out_len)
+{
+    if (!s_mic_opus_q || !out_buf || !out_len) return false;
+    mic_opus_item_t *item = malloc(sizeof(mic_opus_item_t));
+    if (!item) return false;
+    bool ok = false;
+    if (xQueueReceive(s_mic_opus_q, item, 0) == pdTRUE) {
+        if (item->len <= max_len) {
+            memcpy(out_buf, item->data, item->len);
+            *out_len = item->len;
+            ok = true;
+        }
+    }
+    free(item);
+    return ok;
 }
 
 void rtc_endpoint_set_wire_rx_cb(rtc_wire_rx_cb_t cb)

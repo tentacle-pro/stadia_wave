@@ -35,9 +35,11 @@ idf_component_register(
         esp_driver_gpio
         esp_rom
         esp_timer
+        esp_ringbuf
         espressif__cjson
         espressif__usb_device_uac
         espressif__tinyusb
+        espressif__esp_audio_codec
 )
 
 idf_build_get_property(build_components BUILD_COMPONENTS)

@@ -66,3 +66,8 @@
     - 真机上 Mac 网页手柄测试通过（免驱 DS4 识别与输入全部正常）。
     - 实现 [game_session.c](file:///Users/dio/workspace/stadia_wave/esp32s3/stage-1_firmware/main/game_session.c)：`Display Link READY` 后自动发送 `StartGame`，处理手柄 `ProxyRequest`（`GenerateInitialization`），在 UDP `:40002` 建立 GameSession ICE/DTLS 通道，并将主机下发的 DS4 `0x05` 震动报告映射为 `InputFeedbackMessage_V2.gamepad_vibration`（`0..65535`，带 2 秒看门狗保活）驱动手柄马达震动。
     - 已接入 `main.c` 并通过 `idf.py build` 编译（`stadia_wireless_adapter.bin` = `0x11bba0` bytes）。
+  - **Step 6B-2 完成（Stage-1 Mode 1 全功能完整固件编译通过，待最终双端音频实测）**：
+    - 真机验证 `GameSession DTLS Connected` 与主机下发震动实测有效。
+    - 在 [rtc_endpoint.c](file:///Users/dio/workspace/stadia_wave/esp32s3/stage-1_firmware/main/rtc_endpoint.c) 导出 DTLS-SRTP 密钥，实现 RFC 3711 `AES_128_CM_HMAC_SHA1_80` 加解密与 RTP 收发。
+    - 在 [usb_bridge.c](file:///Users/dio/workspace/stadia_wave/esp32s3/stage-1_firmware/main/usb_bridge.c) 接入 Core 1 Opus 编解码任务（48kHz 2ch 编码 → 手柄耳机；手柄麦克风 → 48kHz 1ch 解码 → UAC Mic），并在 [display_rpc.c](file:///Users/dio/workspace/stadia_wave/esp32s3/stage-1_firmware/main/display_rpc.c) 自动下发 `SetAudioMode(2, true)` 与 `set_microphone(true)`。
+    - `idf.py build` 编译通过（`stadia_wireless_adapter.bin` = `0x148960` bytes）。
