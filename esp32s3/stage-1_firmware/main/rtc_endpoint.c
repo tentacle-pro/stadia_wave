@@ -106,6 +106,7 @@ static int dtls_bio_send(void *ctx, const unsigned char *buf, size_t len)
         return MBEDTLS_ERR_SSL_WANT_WRITE;
     }
     int ret = sendto(s_udp_fd, buf, len, 0, (struct sockaddr *)&s_peer_addr, sizeof(s_peer_addr));
+    ESP_LOGI(TAG, "DTLS TX: %zuB -> ret=%d (errno=%d)", len, ret, ret < 0 ? errno : 0);
     if (ret < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
             return MBEDTLS_ERR_SSL_WANT_WRITE;
@@ -414,6 +415,8 @@ static void rtc_endpoint_task(void *arg)
     ESP_ERROR_CHECK(mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
                                                 MBEDTLS_SSL_TRANSPORT_DATAGRAM,
                                                 MBEDTLS_SSL_PRESET_DEFAULT));
+    mbedtls_ssl_conf_min_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_2);
+    mbedtls_ssl_conf_max_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_2);
     mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_ca_chain(&conf, srvcert.next, NULL);
     ESP_ERROR_CHECK(mbedtls_ssl_conf_own_cert(&conf, &srvcert, &pkey));
