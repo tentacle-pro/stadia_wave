@@ -419,7 +419,12 @@ static char *encrypt_wifi_password(const char *pub_b64, const char *password)
     }
 
     psa_key_attributes_t attrs = PSA_KEY_ATTRIBUTES_INIT;
-    psa_set_key_usage_flags(&attrs, PSA_KEY_USAGE_ENCRYPT);
+    ret = mbedtls_pk_get_psa_attributes(&pk, PSA_KEY_USAGE_ENCRYPT, &attrs);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "mbedtls_pk_get_psa_attributes failed: -0x%04x", -ret);
+        mbedtls_pk_free(&pk);
+        return NULL;
+    }
     psa_set_key_algorithm(&attrs, PSA_ALG_RSA_PKCS1V15_CRYPT);
 
     mbedtls_svc_key_id_t key_id = MBEDTLS_SVC_KEY_ID_INIT;
