@@ -412,14 +412,14 @@ static void rtc_endpoint_task(void *arg)
         return;
     }
 
-    ESP_ERROR_CHECK(mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
+    ESP_ERROR_CHECK(mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_SERVER,
                                                 MBEDTLS_SSL_TRANSPORT_DATAGRAM,
                                                 MBEDTLS_SSL_PRESET_DEFAULT));
     mbedtls_ssl_conf_min_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_2);
     mbedtls_ssl_conf_max_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_2);
-    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_ca_chain(&conf, srvcert.next, NULL);
     ESP_ERROR_CHECK(mbedtls_ssl_conf_own_cert(&conf, &srvcert, &pkey));
+    mbedtls_ssl_conf_dtls_cookies(&conf, NULL, NULL, NULL);
     mbedtls_ssl_conf_dtls_srtp_protection_profiles(&conf, srtp_profiles);
 
     ESP_ERROR_CHECK(mbedtls_ssl_setup(&ssl, &conf));
@@ -449,6 +449,8 @@ static void rtc_endpoint_task(void *arg)
     uint8_t *rx_buf = malloc(1600);
     uint8_t *tx_buf = malloc(WIRE_MAX_PAYLOAD + 8);
     wire_tx_item_t *tx_item = malloc(sizeof(wire_tx_item_t));
+    int64_t last_stun_us = 0;
+    bool dtls_started = false;
 
     while (1) {
         struct sockaddr_in from;
@@ -464,13 +466,26 @@ static void rtc_endpoint_task(void *arg)
                     s_has_peer = true;
                 }
                 ESP_LOGI(TAG, "DTLS RX: %dB (ct=%u)", n, b0);
+                if (s_dtls_connected && n > 13 && rx_buf[0] == 22 && rx_buf[13] == 1) {
+                    ESP_LOGW(TAG, "New DTLS ClientHello -> resetting DTLS session");
+                    s_dtls_connected = false;
+                    s_rx_head = s_rx_tail = s_rx_count = 0;
+                    mbedtls_ssl_session_reset(&ssl);
+                }
+                dtls_started = true;
                 dtls_rx_push(rx_buf, (size_t)n);
             } else {
                 ESP_LOGD(TAG, "UDP packet b0=%u, len=%d", b0, n);
             }
         }
 
-        if (s_has_peer && !s_dtls_connected) {
+        int64_t now_us = esp_timer_get_time();
+        if (s_has_peer && !s_dtls_connected && (now_us - last_stun_us >= 1000000)) {
+            last_stun_us = now_us;
+            send_stun_binding_request(&s_peer_addr);
+        }
+
+        if (s_has_peer && !s_dtls_connected && dtls_started) {
             int hs = mbedtls_ssl_handshake(&ssl);
             if (hs == 0) {
                 s_dtls_connected = true;
@@ -478,6 +493,7 @@ static void rtc_endpoint_task(void *arg)
             } else if (hs != MBEDTLS_ERR_SSL_WANT_READ && hs != MBEDTLS_ERR_SSL_WANT_WRITE) {
                 ESP_LOGW(TAG, "DTLS handshake error: -0x%04x -> resetting session", -hs);
                 s_rx_head = s_rx_tail = s_rx_count = 0;
+                dtls_started = false;
                 mbedtls_ssl_session_reset(&ssl);
             }
         }
