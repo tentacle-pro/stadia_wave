@@ -1,4 +1,5 @@
 #include "ble_provisioner.h"
+#include "display_rpc.h"
 #include "dns_sntp.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -55,6 +56,7 @@ void app_main(void)
     ESP_ERROR_CHECK(wifi_ap_init());
     ESP_ERROR_CHECK(dns_sntp_start());
     ESP_ERROR_CHECK(rtc_endpoint_start());
+    ESP_ERROR_CHECK(display_rpc_start());
     ESP_ERROR_CHECK(https_server_start());
     ESP_ERROR_CHECK(ble_provisioner_init());
 

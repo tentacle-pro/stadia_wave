@@ -7,6 +7,7 @@ idf_component_register(
         "session_signaling.c"
         "https_server.c"
         "rtc_endpoint.c"
+        "display_rpc.c"
         "proto_gen/controller_message.pb.c"
         "proto_gen/discovery_api.pb.c"
         "proto_gen/input.pb.c"

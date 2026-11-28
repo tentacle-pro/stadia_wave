@@ -54,3 +54,7 @@
   - **Step 4 完成（`rtc_endpoint` 编译通过，待真机联调）**：
     - 实现 [rtc_endpoint.c](file:///Users/dio/workspace/stadia_wave/esp32s3/stage-1_firmware/main/rtc_endpoint.c)：开机自动计算证书 SHA-256 指纹注入 `session_signaling`；UDP `:40000` 复用 ICE-lite STUN Binding Response（`XOR-MAPPED-ADDRESS` + `MESSAGE-INTEGRITY` HMAC-SHA1 + `FINGERPRINT` CRC32）与 DTLS 1.2 Server（`use_srtp` `SRTP_AES128_CM_HMAC_SHA1_80`，`raw_dtls` WireHeader2 8 字节帧头解析与发送队列）。
     - 已接入 `main.c` 并通过 `idf.py build` 编译（`stadia_wireless_adapter.bin` = `0x1110c0` bytes）。
+  - **Step 5 完成（`display_rpc` 编译通过，待真机联调）**：
+    - 真机验证突破 `STUN` → `DTLS 1.2 Handshake Complete` → `ResolveDiscovery received` 里程碑。
+    - 实现 [display_rpc.c](file:///Users/dio/workspace/stadia_wave/esp32s3/stage-1_firmware/main/display_rpc.c)：`ResolveDiscovery` 到达后发送 `GetControllerStateRequest` 进入 `READY` 状态，打印硬件信息与耳机插拔/电量通知，响应手柄 `GetCurrentTimeRequest`（原样回显 `controller_time_us`）与 `keepalive`，并实时解码按键/摇杆/扳机输入（`ControllerToDisplay #3`）。
+    - 已接入 `main.c` 并通过 `idf.py build` 编译（`stadia_wireless_adapter.bin` = `0x112d30` bytes）。
