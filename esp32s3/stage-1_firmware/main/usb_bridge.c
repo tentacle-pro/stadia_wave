@@ -390,8 +390,7 @@ esp_err_t usb_bridge_init(void)
     }
 
     xTaskCreatePinnedToCore(usb_hid_task, "usb_hid", 3072, NULL, 5, NULL, 1);
-    xTaskCreatePinnedToCoreWithCaps(audio_duplex_task, "opus_duplex", 49152, NULL, 3, NULL, 1,
-                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    xTaskCreatePinnedToCore(audio_duplex_task, "opus_duplex", 32768, NULL, 3, NULL, 1);
     ESP_LOGI(TAG, "USB Bridge initialized (DS4 HID + UAC 2.0 + Core 1 Opus)");
     return ESP_OK;
 }
