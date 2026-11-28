@@ -19,3 +19,9 @@ ll /dev/cu.*
 - 具体开发过程见官方入门文档
 > https://docs.espressif.com/projects/esp-idf/zh_CN/stable/esp32s3/get-started/linux-macos-start-project.html
 
+idf.py set-target esp32s3
+idf.py menuconfig
+idf.py build
+idf.py -p PORT flash
+idf.py -p PORT monitor
+> 通过Ctrl+]退出monitor模式
