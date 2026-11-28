@@ -6,6 +6,7 @@
 #include "esp_psram.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "game_session.h"
 #include "https_server.h"
 #include "nvs_flash.h"
 #include "rtc_endpoint.h"
@@ -58,6 +59,8 @@ void app_main(void)
     ESP_ERROR_CHECK(wifi_ap_init());
     ESP_ERROR_CHECK(dns_sntp_start());
     ESP_ERROR_CHECK(rtc_endpoint_start());
+    ESP_ERROR_CHECK(game_session_start());
+    usb_bridge_set_rumble_cb(game_session_set_rumble);
     display_rpc_set_input_cb(usb_bridge_update_input);
     ESP_ERROR_CHECK(display_rpc_start());
     ESP_ERROR_CHECK(https_server_start());

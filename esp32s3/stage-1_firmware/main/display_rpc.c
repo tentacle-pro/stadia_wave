@@ -1,4 +1,5 @@
 #include "display_rpc.h"
+#include "game_session.h"
 #include "rtc_endpoint.h"
 #include "session_signaling.h"
 
@@ -135,29 +136,13 @@ static esp_err_t send_rpc_request(const gotham_display_DisplayToController *dtc,
     return ret;
 }
 
-static esp_err_t send_rpc_response(uint32_t ticket, gotham_rpc_StatusCode code,
-                                   const gotham_display_DisplayToController *dtc)
+static esp_err_t send_raw_rpc_response(uint32_t ticket, gotham_rpc_StatusCode code,
+                                       const uint8_t *dtc_bytes, size_t dtc_len)
 {
-    uint8_t *inner = malloc(256);
-    uint8_t *outer = malloc(320);
-    if (!inner || !outer) {
-        free(inner);
-        free(outer);
-        return ESP_ERR_NO_MEM;
-    }
+    uint8_t *outer = malloc(dtc_len + 96);
+    if (!outer) return ESP_ERR_NO_MEM;
 
-    size_t inner_len = 0;
-    if (dtc) {
-        pb_ostream_t is = pb_ostream_from_buffer(inner, 256);
-        if (!pb_encode(&is, gotham_display_DisplayToController_fields, dtc)) {
-            free(inner);
-            free(outer);
-            return ESP_FAIL;
-        }
-        inner_len = is.bytes_written;
-    }
-
-    bytes_enc_t pay_ctx = {.data = inner, .len = inner_len};
+    bytes_enc_t pay_ctx = {.data = dtc_bytes, .len = dtc_len};
     gotham_rpc_RpcMessage rpc = gotham_rpc_RpcMessage_init_zero;
     rpc.which_payload = gotham_rpc_RpcMessage_response_tag;
     rpc.payload.response.has_ticket = true;
@@ -166,19 +151,34 @@ static esp_err_t send_rpc_response(uint32_t ticket, gotham_rpc_StatusCode code,
     rpc.payload.response.code = code;
     rpc.payload.response.error_message.funcs.encode = enc_str_cb;
     rpc.payload.response.error_message.arg = (void *)"";
-    if (inner_len > 0) {
+    if (dtc_bytes && dtc_len > 0) {
         rpc.payload.response.payload.funcs.encode = enc_bytes_cb;
         rpc.payload.response.payload.arg = &pay_ctx;
     }
 
-    pb_ostream_t os = pb_ostream_from_buffer(outer, 320);
+    pb_ostream_t os = pb_ostream_from_buffer(outer, dtc_len + 96);
     esp_err_t ret = ESP_FAIL;
     if (pb_encode(&os, gotham_rpc_RpcMessage_fields, &rpc)) {
         ret = rtc_endpoint_send_wire(WIRE_ID_DC_RPC_DISPLAY, outer, os.bytes_written);
     }
-
-    free(inner);
     free(outer);
+    return ret;
+}
+
+static esp_err_t send_rpc_response(uint32_t ticket, gotham_rpc_StatusCode code,
+                                   const gotham_display_DisplayToController *dtc)
+{
+    if (!dtc) {
+        return send_raw_rpc_response(ticket, code, NULL, 0);
+    }
+    uint8_t *inner = malloc(256);
+    if (!inner) return ESP_ERR_NO_MEM;
+    pb_ostream_t is = pb_ostream_from_buffer(inner, 256);
+    esp_err_t ret = ESP_FAIL;
+    if (pb_encode(&is, gotham_display_DisplayToController_fields, dtc)) {
+        ret = send_raw_rpc_response(ticket, code, inner, is.bytes_written);
+    }
+    free(inner);
     return ret;
 }
 
@@ -243,8 +243,26 @@ static void handle_controller_to_display_req(uint32_t ticket, const uint8_t *buf
         send_rpc_response(ticket, gotham_rpc_StatusCode_OK, NULL);
         s_ready = false;
     } else if (variant == gotham_display_ControllerToDisplay_proxy_request_tag) {
-        ESP_LOGI(TAG, "Controller ProxyRequest (ticket=%lu, len=%zu)", (unsigned long)ticket, sub_len);
-        send_rpc_response(ticket, gotham_rpc_StatusCode_UNIMPLEMENTED, NULL);
+        uint8_t *body = malloc(1024);
+        uint8_t *dtc_out = malloc(640);
+        if (body && dtc_out) {
+            bytes_dec_t bctx = {.buf = body, .cap = 1024, .len = 0};
+            gotham_display_ProxyRequest preq = gotham_display_ProxyRequest_init_zero;
+            preq.body.funcs.decode = dec_bytes_cb;
+            preq.body.arg = &bctx;
+            pb_istream_t is = pb_istream_from_buffer(sub, sub_len);
+            size_t dtc_len = 0;
+            if (pb_decode(&is, gotham_display_ProxyRequest_fields, &preq) &&
+                game_session_handle_proxy_request(body, bctx.len, dtc_out, 640, &dtc_len)) {
+                send_raw_rpc_response(ticket, gotham_rpc_StatusCode_OK, dtc_out, dtc_len);
+            } else {
+                send_rpc_response(ticket, gotham_rpc_StatusCode_INTERNAL, NULL);
+            }
+        } else {
+            send_rpc_response(ticket, gotham_rpc_StatusCode_RESOURCE_EXHAUSTED, NULL);
+        }
+        free(body);
+        free(dtc_out);
     } else {
         ESP_LOGD(TAG, "Unhandled CTD request variant=%lu (ticket=%lu)",
                  (unsigned long)variant, (unsigned long)ticket);
@@ -306,6 +324,8 @@ static void handle_controller_to_display_resp(uint32_t ticket, gotham_rpc_Status
             ESP_LOGI(TAG, ">>> MILESTONE: Display Link READY! <<<");
             ESP_LOGI(TAG, "  HW: mfg='%s', prod='%s', hw='%s', fw='%s', serial='%s', headset=%d",
                      mfg, prod, hw, fw, serial, s_last_input.headset_plugged);
+            ESP_LOGI(TAG, "Sending StartGame to enable GameSession & Rumble...");
+            display_rpc_send_start_game("stadia-wave-01");
         }
         free(st);
     } else {

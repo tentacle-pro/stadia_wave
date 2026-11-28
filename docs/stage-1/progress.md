@@ -62,3 +62,7 @@
     - 真机验证 `Display Link READY`（`GA00827-US`, `fw=282115`）并实时收到 Stadia 摇杆/按键输入。
     - 实现 [usb_bridge.c](file:///Users/dio/workspace/stadia_wave/esp32s3/stage-1_firmware/main/usb_bridge.c)：初始化 DualShock 4 HID + UAC 2.0 复合设备，将 Stadia 按键/D-pad/摇杆/L2R2 实时映射为 64 字节 DS4 输入报告（125Hz），并接收主机震动输出报告。
     - 已接入 `main.c` 并通过 `idf.py build` 编译（`stadia_wireless_adapter.bin` = `0x1194b0` bytes）。
+  - **Step 6B-1 完成（GameSession + 震动闭环编译通过，待实测）**：
+    - 真机上 Mac 网页手柄测试通过（免驱 DS4 识别与输入全部正常）。
+    - 实现 [game_session.c](file:///Users/dio/workspace/stadia_wave/esp32s3/stage-1_firmware/main/game_session.c)：`Display Link READY` 后自动发送 `StartGame`，处理手柄 `ProxyRequest`（`GenerateInitialization`），在 UDP `:40002` 建立 GameSession ICE/DTLS 通道，并将主机下发的 DS4 `0x05` 震动报告映射为 `InputFeedbackMessage_V2.gamepad_vibration`（`0..65535`，带 2 秒看门狗保活）驱动手柄马达震动。
+    - 已接入 `main.c` 并通过 `idf.py build` 编译（`stadia_wireless_adapter.bin` = `0x11bba0` bytes）。
