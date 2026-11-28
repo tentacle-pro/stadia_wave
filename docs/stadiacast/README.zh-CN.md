@@ -1,14 +1,3 @@
-<p align="center">
-  <img alt="Stadiacast：为 Stadia 手柄 Wi-Fi 模式提供服务的本地服务器" src="https://raw.githubusercontent.com/jkfran/stadiacast/main/docs/images/logo.svg" width="560">
-</p>
-
-<p align="center">
-  <a href="https://github.com/jkfran/stadiacast/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/jkfran/stadiacast/actions/workflows/ci.yml/badge.svg"></a>
-  <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&amp;logoColor=white">
-  <a href="https://pypi.org/project/stadiacast/"><img alt="PyPI" src="https://img.shields.io/pypi/v/stadiacast"></a>
-  <img alt="Status: works end to end" src="https://img.shields.io/badge/status-works%20end%20to%20end-brightgreen">
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
-</p>
 
 > 本文是 stadiacast 1.3.0 附带的 `README.md` 的简体中文翻译（非官方译文），原文见
 > https://github.com/jkfran/stadiacast 。命令行参数、固件标识与技术名词保留英文。
@@ -34,10 +23,6 @@ Stadiacast 是一个运行在你自己网络里的小型服务器，用来顶替
 - 🎧 **耳机音频。** 电脑正在播放的声音、或任意音频文件，都能串流到手柄上插的耳机。
 - 🎤 **手柄的麦克风。** 可以变成电脑的一个麦克风供语音聊天使用（一直开、或按住 Assistant 键时才开），也可以录成文件。
 - 👥 **同时支持多个手柄**，每个手柄各自是一个玩家。
-
-<p align="center">
-  <img alt="手柄通过 Wi-Fi 与 Stadiacast 通信，Stadiacast 再把输入喂给游戏，表现为 Xbox 360 手柄" src="https://raw.githubusercontent.com/jkfran/stadiacast/main/docs/images/flow.svg" width="680">
-</p>
 
 ## 快速开始
 

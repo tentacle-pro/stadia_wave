@@ -1,0 +1,4 @@
+## IDF Component Manager Manifest File
+dependencies:
+  espressif/usb_device_uac: "*"
+  idf: ">=6.0"
