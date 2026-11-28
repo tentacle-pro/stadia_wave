@@ -68,7 +68,7 @@ static bool s_dtls_connected = false;
 static rtc_wire_rx_cb_t s_wire_rx_cb = NULL;
 static QueueHandle_t s_wire_tx_q = NULL;
 
-static dgram_pkt_t s_dtls_rx_q[DTLS_RX_Q_CAP];
+static dgram_pkt_t *s_dtls_rx_q = NULL;
 static int s_rx_head = 0;
 static int s_rx_tail = 0;
 static int s_rx_count = 0;
@@ -538,11 +538,12 @@ static void rtc_endpoint_task(void *arg)
 
 esp_err_t rtc_endpoint_start(void)
 {
+    s_dtls_rx_q = calloc(DTLS_RX_Q_CAP, sizeof(dgram_pkt_t));
     s_wire_tx_q = xQueueCreate(WIRE_TX_Q_CAP, sizeof(wire_tx_item_t));
-    if (!s_wire_tx_q) {
+    if (!s_dtls_rx_q || !s_wire_tx_q) {
         return ESP_ERR_NO_MEM;
     }
-    xTaskCreatePinnedToCore(rtc_endpoint_task, "rtc_ep", 16384, NULL, 6, NULL, 0);
+    xTaskCreatePinnedToCore(rtc_endpoint_task, "rtc_ep", 8192, NULL, 6, NULL, 0);
     return ESP_OK;
 }
 

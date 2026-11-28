@@ -356,7 +356,7 @@ static void https_accept_task(void *arg)
         carg->client_fd = client_fd;
         carg->conf = &s_conf;
 
-        if (xTaskCreatePinnedToCore(https_conn_task, "https_conn", 12288, carg, 5, NULL, 0) != pdPASS) {
+        if (xTaskCreatePinnedToCore(https_conn_task, "https_conn", 8192, carg, 5, NULL, 0) != pdPASS) {
             ESP_LOGE(TAG, "Failed to spawn https_conn task");
             free(carg);
             close(client_fd);
@@ -366,6 +366,6 @@ static void https_accept_task(void *arg)
 
 esp_err_t https_server_start(void)
 {
-    xTaskCreatePinnedToCore(https_accept_task, "https_acc", 8192, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(https_accept_task, "https_acc", 4096, NULL, 5, NULL, 0);
     return ESP_OK;
 }

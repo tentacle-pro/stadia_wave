@@ -208,7 +208,7 @@ static void usb_hid_task(void *arg)
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(8));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
