@@ -6,6 +6,7 @@ idf_component_register(
         "ble_provisioner.c"
         "session_signaling.c"
         "https_server.c"
+        "rtc_endpoint.c"
         "proto_gen/controller_message.pb.c"
         "proto_gen/discovery_api.pb.c"
         "proto_gen/input.pb.c"

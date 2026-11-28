@@ -26,7 +26,7 @@
 
 ## 3. 正式实施里程碑（MVP 合龙）
 
-- [ ] **Step 1**：主固件骨架 + PSRAM 配置 + `nanopb` 生成 `.proto` + 嵌入 GTS `identity.bin`
+- [x] **Step 1**：主固件骨架 + PSRAM 配置 + `nanopb` 生成 `.proto` + 嵌入 GTS `identity.bin`（`stadia_wireless_adapter.bin` 编译通过，`0x2ed40` 字节）
 - [ ] **Step 2**：离线网关基础层（SoftAP + 泛解析 DNS + SNTP + 一键 BLE 配网）
 - [ ] **Step 3**：HTTPS 信令 + Clearcut SNI 拦截 + Discovery & `/gmsg` 长轮询
 - [ ] **Step 4**：WebRTC 数据面（STUN + DTLS + SRTP + WireHeader2）+ Display Link READY & 按键读取
@@ -46,3 +46,11 @@
   - **PoC-3 真机验收通过**：DTLS 1.2 + `use_srtp` 60B 密钥导出自检通过；真机手柄信任 `identity.bin` 3 级 GTS 证书链，Clearcut `play.googleapis.com` 被 SNI 回调在 20ms 内秒拒，成功发出 `FirmwareVersionCheck` 与 `RegisterController`（457 字节）。
   - **PoC-4 真机压测通过**：ESP32-S3-N16R8（240MHz, `-O2`）运行 `2ch` 耳机 Opus 编码 + `1ch` 麦解码合计仅 **7.79ms / 20ms（39.0% Core 1）**，Live UAC 全双工 50fps 零丢帧且剩余堆内存 8.6MB；**确定保留四功能全双工方案**。
   - **全局工程规范备忘**：所有含 `mbedtls` / `Opus` 的任务必须给足栈空间（`main_task` ≥ 16KB，Opus 任务 ≥ 64KB），生产构建需开启 `CONFIG_COMPILER_OPTIMIZATION_PERF=y`（`-O2`）和 `4MB` 自定义分区表。
+  - **Step 1 完成**：`stage-1_firmware` 主工程骨架搭建完成，7 份 Stadia `.proto`/`.descriptor` 全部通过 `nanopb`（启用 `PB_FIELD_32BIT=1` 兼容 `1000000+` 扩展 tag）生成 C 代码并验证编译链接通过。
+  - **Step 2 & Step 3 完成（编译通过，待真机联调）**：
+    - 整合离线网关基座：`wifi_ap`（`StadiaWave-PoC` / `stadia1234`，CH6 WPA2-PSK CCMP）、`dns_sntp`（通配符 DNS `:53` + SNTP `:123`）及 `ble_provisioner`（BOOT 键 `GPIO0` 一键触发 BLE 扫描与配网）。
+    - 实现 `session_signaling`（`nanopb` 编解码 `FirmwareVersionCheck`、`RegisterController`、`DiscoverDisplay`、`GmsgPollRequest`/`GmsgEnvelope` 扩展 `269197544`、`ResolveDiscovery` 以及 `WebRtcSdpAndIceCandidates` Offer 解析与 Answer `192.168.4.1:40000` 生成）。
+    - 升级 `https_server` 为每连接独立 FreeRTOS 任务并发模型（避免 `/gmsg` 长轮询阻塞 `ResolveDiscovery` 与 Clearcut SNI 拒绝），`idf.py build` 编译通过（`stadia_wireless_adapter.bin` = `0x10fe30` bytes）。
+  - **Step 4 完成（`rtc_endpoint` 编译通过，待真机联调）**：
+    - 实现 [rtc_endpoint.c](file:///Users/dio/workspace/stadia_wave/esp32s3/stage-1_firmware/main/rtc_endpoint.c)：开机自动计算证书 SHA-256 指纹注入 `session_signaling`；UDP `:40000` 复用 ICE-lite STUN Binding Response（`XOR-MAPPED-ADDRESS` + `MESSAGE-INTEGRITY` HMAC-SHA1 + `FINGERPRINT` CRC32）与 DTLS 1.2 Server（`use_srtp` `SRTP_AES128_CM_HMAC_SHA1_80`，`raw_dtls` WireHeader2 8 字节帧头解析与发送队列）。
+    - 已接入 `main.c` 并通过 `idf.py build` 编译（`stadia_wireless_adapter.bin` = `0x1110c0` bytes）。

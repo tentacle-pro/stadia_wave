@@ -7,6 +7,7 @@
 #include "freertos/task.h"
 #include "https_server.h"
 #include "nvs_flash.h"
+#include "rtc_endpoint.h"
 #include "session_signaling.h"
 #include "wifi_ap.h"
 
@@ -53,6 +54,7 @@ void app_main(void)
     session_signaling_init();
     ESP_ERROR_CHECK(wifi_ap_init());
     ESP_ERROR_CHECK(dns_sntp_start());
+    ESP_ERROR_CHECK(rtc_endpoint_start());
     ESP_ERROR_CHECK(https_server_start());
     ESP_ERROR_CHECK(ble_provisioner_init());
 
