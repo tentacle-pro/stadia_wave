@@ -17,10 +17,12 @@ extern const uint8_t gts_fullchain_pem_end[]   asm("_binary_gts_fullchain_pem_en
 extern const uint8_t gts_privkey_pem_start[]   asm("_binary_gts_privkey_pem_start");
 extern const uint8_t gts_privkey_pem_end[]     asm("_binary_gts_privkey_pem_end");
 
+#define DGRAM_QUEUE_CAP 32
+
 // Simple in-memory datagram ring pipe for loopback DTLS handshake self-test
 typedef struct {
-    uint8_t pkts[8][1500];
-    size_t lens[8];
+    uint8_t pkts[DGRAM_QUEUE_CAP][1500];
+    size_t lens[DGRAM_QUEUE_CAP];
     int head;
     int tail;
     int count;
@@ -71,12 +73,12 @@ static int timer_get(void *ctx)
 static int mem_send(void *ctx, const unsigned char *buf, size_t len)
 {
     mem_bio_t *bio = (mem_bio_t *)ctx;
-    if (bio->tx->count >= 8 || len > sizeof(bio->tx->pkts[0])) {
+    if (bio->tx->count >= DGRAM_QUEUE_CAP || len > sizeof(bio->tx->pkts[0])) {
         return MBEDTLS_ERR_SSL_WANT_WRITE;
     }
     memcpy(bio->tx->pkts[bio->tx->tail], buf, len);
     bio->tx->lens[bio->tx->tail] = len;
-    bio->tx->tail = (bio->tx->tail + 1) % 8;
+    bio->tx->tail = (bio->tx->tail + 1) % DGRAM_QUEUE_CAP;
     bio->tx->count++;
     return (int)len;
 }
@@ -90,7 +92,7 @@ static int mem_recv(void *ctx, unsigned char *buf, size_t len)
     size_t plen = bio->rx->lens[bio->rx->head];
     size_t copy = plen < len ? plen : len;
     memcpy(buf, bio->rx->pkts[bio->rx->head], copy);
-    bio->rx->head = (bio->rx->head + 1) % 8;
+    bio->rx->head = (bio->rx->head + 1) % DGRAM_QUEUE_CAP;
     bio->rx->count--;
     return (int)copy;
 }
@@ -191,7 +193,7 @@ esp_err_t dtls_srtp_run_selftest(void)
 
     int r_cli = MBEDTLS_ERR_SSL_WANT_READ;
     int r_srv = MBEDTLS_ERR_SSL_WANT_READ;
-    for (int step = 0; step < 64; step++) {
+    for (int step = 0; step < 256; step++) {
         if (r_cli == MBEDTLS_ERR_SSL_WANT_READ || r_cli == MBEDTLS_ERR_SSL_WANT_WRITE) {
             r_cli = mbedtls_ssl_handshake(&cli_ssl);
         }

@@ -106,6 +106,8 @@ static void handle_http_requests(mbedtls_ssl_context *ssl, const char *sni)
                 continue;
             }
             if (r <= 0) {
+                ESP_LOGI(TAG, "HTTPS conn (%s) closed/timeout: r=%d (-0x%04x)",
+                         sni, r, r < 0 ? -r : 0);
                 return;
             }
             total += r;
