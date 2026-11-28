@@ -54,6 +54,7 @@ static volatile bool s_rumble_dirty = false;
 
 static RingbufHandle_t s_spk_rb = NULL;
 static RingbufHandle_t s_mic_rb = NULL;
+static volatile bool s_mic_primed = false;
 
 static uint8_t map_dpad_hat(uint32_t btn)
 {
@@ -193,11 +194,21 @@ static esp_err_t uac_input_cb(uint8_t *buf, size_t len, size_t *bytes_read, void
 {
     (void)cb_ctx;
     size_t got = 0;
-    if (s_mic_rb) {
-        uint8_t *item = xRingbufferReceiveUpTo(s_mic_rb, &got, 0, len);
-        if (item) {
-            memcpy(buf, item, got);
+    if (s_mic_rb && s_mic_primed) {
+        size_t pos = 0;
+        while (pos < len) {
+            size_t chunk = 0;
+            uint8_t *item = xRingbufferReceiveUpTo(s_mic_rb, &chunk, 0, len - pos);
+            if (!item || chunk == 0) {
+                break;
+            }
+            memcpy(buf + pos, item, chunk);
             vRingbufferReturnItem(s_mic_rb, item);
+            pos += chunk;
+        }
+        got = pos;
+        if (got == 0) {
+            s_mic_primed = false;
         }
     }
     if (got < len) {
@@ -274,45 +285,71 @@ static void audio_duplex_task(void *arg)
     uint8_t *spk_opus = malloc((size_t)out_sz);
     uint8_t *mic_opus = malloc(384);
     uint8_t *mic_pcm = malloc(MONO_PCM_BYTES);
+    size_t spk_acc = 0;
 
     ESP_LOGI(TAG, "Core 1 Opus Audio Bridge ready (enc=%dB->%dB, dec=48kHz mono)", in_sz, out_sz);
 
     TickType_t last_wake = xTaskGetTickCount();
     uint32_t slot = 0;
+    uint32_t mic_ok = 0, mic_err = 0, spk_tx = 0, mic_queued = 0;
 
     while (1) {
-        // 1. Headset TX: UAC Speaker (48kHz stereo) -> Opus Enc -> SRTP
-        if (s_spk_rb && rtc_endpoint_is_srtp_ready()) {
-            size_t got = 0;
-            uint8_t *item = xRingbufferReceiveUpTo(s_spk_rb, &got, 0, (size_t)in_sz);
-            if (item) {
-                if (got == (size_t)in_sz) {
-                    memcpy(spk_pcm, item, got);
-                    vRingbufferReturnItem(s_spk_rb, item);
+        // 1. Headset TX: accumulate 48kHz stereo PCM without dropping wrap-around slices
+        if (s_spk_rb) {
+            while (spk_acc < (size_t)in_sz) {
+                size_t got = 0;
+                uint8_t *item = xRingbufferReceiveUpTo(s_spk_rb, &got, 0, (size_t)in_sz - spk_acc);
+                if (!item || got == 0) {
+                    break;
+                }
+                memcpy(spk_pcm + spk_acc, item, got);
+                vRingbufferReturnItem(s_spk_rb, item);
+                spk_acc += got;
+            }
+            if (spk_acc >= (size_t)in_sz) {
+                spk_acc = 0;
+                if (rtc_endpoint_is_srtp_ready()) {
                     esp_audio_enc_in_frame_t inf = {.buffer = spk_pcm, .len = (uint32_t)in_sz};
                     esp_audio_enc_out_frame_t outf = {.buffer = spk_opus, .len = (uint32_t)out_sz};
                     if (esp_opus_enc_process(enc_hd, &inf, &outf) == ESP_AUDIO_ERR_OK &&
                         outf.encoded_bytes > 0) {
                         rtc_endpoint_send_audio_opus(spk_opus, outf.encoded_bytes, slot * FRAME_SAMPLES);
+                        spk_tx++;
                     }
-                } else {
-                    vRingbufferReturnItem(s_spk_rb, item);
                 }
             }
         }
 
-        // 2. Mic RX: SRTP -> Opus Dec -> UAC Mic (48kHz mono)
+        // 2. Mic RX: SRTP -> Opus Dec -> UAC Mic (48kHz mono) with 2-frame jitter prime
         size_t mop_len = 0;
         while (rtc_endpoint_recv_mic_opus(mic_opus, 384, &mop_len)) {
             esp_audio_dec_in_raw_t raw = {.buffer = mic_opus, .len = (uint32_t)mop_len};
             esp_audio_dec_out_frame_t decf = {.buffer = mic_pcm, .len = MONO_PCM_BYTES};
             esp_audio_dec_info_t info = {0};
-            if (esp_opus_dec_decode(dec_hd, &raw, &decf, &info) == ESP_AUDIO_ERR_OK && s_mic_rb) {
-                xRingbufferSend(s_mic_rb, mic_pcm, MONO_PCM_BYTES, 0);
+            esp_audio_err_t derr = esp_opus_dec_decode(dec_hd, &raw, &decf, &info);
+            if (derr == ESP_AUDIO_ERR_OK && s_mic_rb) {
+                uint32_t out_bytes = decf.decoded_size > 0 ? decf.decoded_size : MONO_PCM_BYTES;
+                if (xRingbufferSend(s_mic_rb, mic_pcm, out_bytes, 0) == pdTRUE) {
+                    mic_ok++;
+                    if (!s_mic_primed) {
+                        mic_queued++;
+                        if (mic_queued >= 2) {
+                            s_mic_primed = true;
+                            mic_queued = 0;
+                        }
+                    }
+                }
+            } else {
+                mic_err++;
             }
         }
 
         slot++;
+        if ((slot % 250) == 0 && (mic_ok > 0 || mic_err > 0 || spk_tx > 0)) {
+            ESP_LOGI(TAG, "Audio 5s: SpkTX=%lu, MicOK=%lu, MicErr=%lu",
+                     (unsigned long)spk_tx, (unsigned long)mic_ok, (unsigned long)mic_err);
+            spk_tx = mic_ok = mic_err = 0;
+        }
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(20));
     }
 }

@@ -43,6 +43,8 @@ static uint32_t s_next_ticket = 1;
 static uint32_t s_get_state_ticket = 0;
 static display_rpc_input_cb_t s_input_cb = NULL;
 static stadia_controller_input_t s_last_input = {0};
+static bool s_mic_enabled = true;
+static uint32_t s_prev_buttons = 0;
 
 static bool dec_str_cb(pb_istream_t *stream, const pb_field_t *field, void **arg)
 {
@@ -356,6 +358,18 @@ static void handle_controller_to_display_notif(const uint8_t *buf, size_t len)
             s_last_input.ry = (int16_t)m.f5;
             s_last_input.l2 = (uint8_t)m.f6;
             s_last_input.r2 = (uint8_t)m.f7;
+
+            // Assistant button (bit 10) toggles controller microphone (solid white LED when off)
+            bool asst_now = (m.f1 & (1U << 10)) != 0;
+            bool asst_prev = (s_prev_buttons & (1U << 10)) != 0;
+            s_prev_buttons = m.f1;
+            if (asst_now && !asst_prev && s_ready) {
+                s_mic_enabled = !s_mic_enabled;
+                ESP_LOGI(TAG, "Assistant pressed -> Controller Mic %s",
+                         s_mic_enabled ? "ON (LED blinking)" : "OFF (LED solid)");
+                display_rpc_send_set_microphone(s_mic_enabled);
+            }
+
             if (s_input_cb) {
                 s_input_cb(&s_last_input);
             } else {
