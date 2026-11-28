@@ -411,12 +411,12 @@ static void rtc_endpoint_task(void *arg)
         return;
     }
 
-    ESP_ERROR_CHECK(mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_SERVER,
+    ESP_ERROR_CHECK(mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
                                                 MBEDTLS_SSL_TRANSPORT_DATAGRAM,
                                                 MBEDTLS_SSL_PRESET_DEFAULT));
+    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_ca_chain(&conf, srvcert.next, NULL);
     ESP_ERROR_CHECK(mbedtls_ssl_conf_own_cert(&conf, &srvcert, &pkey));
-    mbedtls_ssl_conf_dtls_cookies(&conf, NULL, NULL, NULL);
     mbedtls_ssl_conf_dtls_srtp_protection_profiles(&conf, srtp_profiles);
 
     ESP_ERROR_CHECK(mbedtls_ssl_setup(&ssl, &conf));
@@ -460,13 +460,7 @@ static void rtc_endpoint_task(void *arg)
                     s_peer_addr = from;
                     s_has_peer = true;
                 }
-                // Detect fresh ClientHello (content_type=22, handshake_type=1) after prior session
-                if (s_dtls_connected && n > 13 && rx_buf[0] == 22 && rx_buf[13] == 1) {
-                    ESP_LOGW(TAG, "New DTLS ClientHello received -> resetting DTLS session");
-                    s_dtls_connected = false;
-                    s_rx_head = s_rx_tail = s_rx_count = 0;
-                    mbedtls_ssl_session_reset(&ssl);
-                }
+                ESP_LOGI(TAG, "DTLS RX: %dB (ct=%u)", n, b0);
                 dtls_rx_push(rx_buf, (size_t)n);
             } else {
                 ESP_LOGD(TAG, "UDP packet b0=%u, len=%d", b0, n);
