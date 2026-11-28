@@ -10,6 +10,7 @@
 #include "nvs_flash.h"
 #include "rtc_endpoint.h"
 #include "session_signaling.h"
+#include "usb_bridge.h"
 #include "wifi_ap.h"
 
 static const char *TAG = "stadia_adapter";
@@ -53,9 +54,11 @@ void app_main(void)
              esp_psram_is_initialized() ? esp_psram_get_size() : 0);
 
     session_signaling_init();
+    ESP_ERROR_CHECK(usb_bridge_init());
     ESP_ERROR_CHECK(wifi_ap_init());
     ESP_ERROR_CHECK(dns_sntp_start());
     ESP_ERROR_CHECK(rtc_endpoint_start());
+    display_rpc_set_input_cb(usb_bridge_update_input);
     ESP_ERROR_CHECK(display_rpc_start());
     ESP_ERROR_CHECK(https_server_start());
     ESP_ERROR_CHECK(ble_provisioner_init());

@@ -106,7 +106,7 @@ static int dtls_bio_send(void *ctx, const unsigned char *buf, size_t len)
         return MBEDTLS_ERR_SSL_WANT_WRITE;
     }
     int ret = sendto(s_udp_fd, buf, len, 0, (struct sockaddr *)&s_peer_addr, sizeof(s_peer_addr));
-    ESP_LOGI(TAG, "DTLS TX: %zuB -> ret=%d (errno=%d)", len, ret, ret < 0 ? errno : 0);
+    ESP_LOGD(TAG, "DTLS TX: %zuB -> ret=%d (errno=%d)", len, ret, ret < 0 ? errno : 0);
     if (ret < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
             return MBEDTLS_ERR_SSL_WANT_WRITE;
@@ -465,7 +465,7 @@ static void rtc_endpoint_task(void *arg)
                     s_peer_addr = from;
                     s_has_peer = true;
                 }
-                ESP_LOGI(TAG, "DTLS RX: %dB (ct=%u)", n, b0);
+                ESP_LOGD(TAG, "DTLS RX: %dB (ct=%u)", n, b0);
                 if (s_dtls_connected && n > 13 && rx_buf[0] == 22 && rx_buf[13] == 1) {
                     ESP_LOGW(TAG, "New DTLS ClientHello -> resetting DTLS session");
                     s_dtls_connected = false;

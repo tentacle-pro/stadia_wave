@@ -8,6 +8,7 @@ idf_component_register(
         "https_server.c"
         "rtc_endpoint.c"
         "display_rpc.c"
+        "usb_bridge.c"
         "proto_gen/controller_message.pb.c"
         "proto_gen/discovery_api.pb.c"
         "proto_gen/input.pb.c"
@@ -34,6 +35,8 @@ idf_component_register(
         esp_rom
         esp_timer
         espressif__cjson
+        espressif__usb_device_uac
+        espressif__tinyusb
 )
 
 idf_build_get_property(build_components BUILD_COMPONENTS)

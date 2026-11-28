@@ -58,3 +58,7 @@
     - 真机验证突破 `STUN` → `DTLS 1.2 Handshake Complete` → `ResolveDiscovery received` 里程碑。
     - 实现 [display_rpc.c](file:///Users/dio/workspace/stadia_wave/esp32s3/stage-1_firmware/main/display_rpc.c)：`ResolveDiscovery` 到达后发送 `GetControllerStateRequest` 进入 `READY` 状态，打印硬件信息与耳机插拔/电量通知，响应手柄 `GetCurrentTimeRequest`（原样回显 `controller_time_us`）与 `keepalive`，并实时解码按键/摇杆/扳机输入（`ControllerToDisplay #3`）。
     - 已接入 `main.c` 并通过 `idf.py build` 编译（`stadia_wireless_adapter.bin` = `0x112d30` bytes）。
+  - **Step 6A 完成（USB DS4 HID + UAC 2.0 桥接编译通过，待上机实测）**：
+    - 真机验证 `Display Link READY`（`GA00827-US`, `fw=282115`）并实时收到 Stadia 摇杆/按键输入。
+    - 实现 [usb_bridge.c](file:///Users/dio/workspace/stadia_wave/esp32s3/stage-1_firmware/main/usb_bridge.c)：初始化 DualShock 4 HID + UAC 2.0 复合设备，将 Stadia 按键/D-pad/摇杆/L2R2 实时映射为 64 字节 DS4 输入报告（125Hz），并接收主机震动输出报告。
+    - 已接入 `main.c` 并通过 `idf.py build` 编译（`stadia_wireless_adapter.bin` = `0x1194b0` bytes）。
