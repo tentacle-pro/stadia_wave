@@ -95,7 +95,7 @@ static void send_http_response(mbedtls_ssl_context *ssl, int status, const char 
 
 static void handle_http_requests(mbedtls_ssl_context *ssl, const char *sni)
 {
-    char req_buf[2048];
+    char req_buf[4096];
     while (1) {
         int total = 0;
         char *hdr_end = NULL;
@@ -106,8 +106,8 @@ static void handle_http_requests(mbedtls_ssl_context *ssl, const char *sni)
                 continue;
             }
             if (r <= 0) {
-                ESP_LOGI(TAG, "HTTPS conn (%s) closed/timeout: r=%d (-0x%04x)",
-                         sni, r, r < 0 ? -r : 0);
+                ESP_LOGI(TAG, "HTTPS conn (%s) closed/timeout: r=%d (-0x%04x), total=%d",
+                         sni, r, r < 0 ? -r : 0, total);
                 return;
             }
             total += r;
@@ -118,6 +118,7 @@ static void handle_http_requests(mbedtls_ssl_context *ssl, const char *sni)
             }
         }
         if (!hdr_end) {
+            ESP_LOGW(TAG, "HTTPS header incomplete/too large (%s): total=%d", sni, total);
             return;
         }
 

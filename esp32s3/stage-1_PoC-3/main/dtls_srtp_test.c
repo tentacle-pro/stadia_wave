@@ -21,7 +21,7 @@ extern const uint8_t gts_privkey_pem_end[]     asm("_binary_gts_privkey_pem_end"
 
 // Simple in-memory datagram ring pipe for loopback DTLS handshake self-test
 typedef struct {
-    uint8_t pkts[DGRAM_QUEUE_CAP][1500];
+    uint8_t pkts[DGRAM_QUEUE_CAP][2048];
     size_t lens[DGRAM_QUEUE_CAP];
     int head;
     int tail;
@@ -178,6 +178,8 @@ esp_err_t dtls_srtp_run_selftest(void)
 
     mbedtls_ssl_setup(&srv_ssl, &srv_conf);
     mbedtls_ssl_setup(&cli_ssl, &cli_conf);
+    mbedtls_ssl_set_mtu(&srv_ssl, 1200);
+    mbedtls_ssl_set_mtu(&cli_ssl, 1200);
 
     mem_bio_t srv_bio = {.rx = q_c2s, .tx = q_s2c};
     mem_bio_t cli_bio = {.rx = q_s2c, .tx = q_c2s};
