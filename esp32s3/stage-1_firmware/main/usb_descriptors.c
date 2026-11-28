@@ -135,23 +135,23 @@ uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 //   0x02: DS4 HID OUT (Rumble / LED)
 //   0x83: DS4 HID IN  (Buttons / Sticks)
 // Total active IN = 4 (<= 5), Total active OUT = 3.
-#define EPNUM_AUDIO_OUT   0x01
-#define EPNUM_AUDIO_FB    0x81
+#define EPNUM_HID_OUT     0x01
+#define EPNUM_HID_IN      0x81
+#define EPNUM_AUDIO_OUT   0x02
 #define EPNUM_AUDIO_IN    0x82
-#define EPNUM_HID_OUT     0x03
-#define EPNUM_HID_IN      0x83
+#define EPNUM_AUDIO_FB    0x83
 
-#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_AUDIO_DEVICE_DESC_LEN + TUD_HID_INOUT_DESC_LEN)
+#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_HID_INOUT_DESC_LEN + TUD_AUDIO_DEVICE_DESC_LEN)
 
 static uint8_t const desc_configuration[] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 250),
 
-    // UAC 2.0 Interfaces (0, 1, 2)
-    TUD_AUDIO_DESCRIPTOR(ITF_NUM_AUDIO_CONTROL, 4, EPNUM_AUDIO_OUT, EPNUM_AUDIO_IN, EPNUM_AUDIO_FB),
-
-    // DS4 HID Interface (3)
+    // DS4 HID Interface (0) - first for highest priority & clean macOS matching
     TUD_HID_INOUT_DESCRIPTOR(ITF_NUM_HID, 7, HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report),
                              EPNUM_HID_OUT, EPNUM_HID_IN, CFG_TUD_HID_EP_BUFSIZE, 5),
+
+    // UAC 2.0 Interfaces (1, 2, 3)
+    TUD_AUDIO_DESCRIPTOR(ITF_NUM_AUDIO_CONTROL, 4, EPNUM_AUDIO_OUT, EPNUM_AUDIO_IN, EPNUM_AUDIO_FB),
 };
 
 uint8_t const *tud_descriptor_configuration_cb(uint8_t index)
