@@ -8,6 +8,7 @@
 #include "esp_audio_dec.h"
 #include "esp_audio_enc.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/ringbuf.h"
 #include "freertos/task.h"
@@ -292,10 +293,12 @@ static void audio_duplex_task(void *arg)
 
     TickType_t last_wake = xTaskGetTickCount();
     uint32_t slot = 0;
+    uint32_t spk_ts = 0;
     uint32_t mic_ok = 0, mic_err = 0, spk_tx = 0, mic_queued = 0;
+    uint64_t enc_us_sum = 0, dec_us_sum = 0;
 
     while (1) {
-        // 1. Headset TX: 60ms pre-buffer, then pull 3840B frames for Opus Enc -> SRTP
+        // 1. Headset TX: 60ms pre-buffer, drain up to 2 frames per wake so wrap/drift never stalls
         if (s_spk_rb) {
             if (!s_spk_primed) {
                 size_t free_sp = xRingbufferGetCurFreeSize(s_spk_rb);
@@ -305,29 +308,38 @@ static void audio_duplex_task(void *arg)
                 }
             }
             if (s_spk_primed) {
-                while (spk_acc < (size_t)in_sz) {
-                    size_t got = 0;
-                    uint8_t *item = xRingbufferReceiveUpTo(s_spk_rb, &got, 0, (size_t)in_sz - spk_acc);
-                    if (!item || got == 0) {
+                int sent_this_tick = 0;
+                while (sent_this_tick < 2) {
+                    while (spk_acc < (size_t)in_sz) {
+                        size_t got = 0;
+                        uint8_t *item = xRingbufferReceiveUpTo(s_spk_rb, &got, 0, (size_t)in_sz - spk_acc);
+                        if (!item || got == 0) {
+                            break;
+                        }
+                        memcpy(spk_pcm + spk_acc, item, got);
+                        vRingbufferReturnItem(s_spk_rb, item);
+                        spk_acc += got;
+                    }
+                    if (spk_acc < (size_t)in_sz) {
+                        if (spk_acc == 0 && sent_this_tick == 0) {
+                            s_spk_primed = false;
+                        }
                         break;
                     }
-                    memcpy(spk_pcm + spk_acc, item, got);
-                    vRingbufferReturnItem(s_spk_rb, item);
-                    spk_acc += got;
-                }
-                if (spk_acc >= (size_t)in_sz) {
                     spk_acc = 0;
                     if (rtc_endpoint_is_srtp_ready()) {
                         esp_audio_enc_in_frame_t inf = {.buffer = spk_pcm, .len = (uint32_t)in_sz};
                         esp_audio_enc_out_frame_t outf = {.buffer = spk_opus, .len = (uint32_t)out_sz};
-                        if (esp_opus_enc_process(enc_hd, &inf, &outf) == ESP_AUDIO_ERR_OK &&
-                            outf.encoded_bytes > 0) {
-                            rtc_endpoint_send_audio_opus(spk_opus, outf.encoded_bytes, slot * FRAME_SAMPLES);
+                        int64_t t0 = esp_timer_get_time();
+                        esp_audio_err_t eerr = esp_opus_enc_process(enc_hd, &inf, &outf);
+                        enc_us_sum += (uint64_t)(esp_timer_get_time() - t0);
+                        if (eerr == ESP_AUDIO_ERR_OK && outf.encoded_bytes > 0) {
+                            rtc_endpoint_send_audio_opus(spk_opus, outf.encoded_bytes, spk_ts);
+                            spk_ts += FRAME_SAMPLES;
                             spk_tx++;
                         }
                     }
-                } else if (spk_acc == 0) {
-                    s_spk_primed = false;
+                    sent_this_tick++;
                 }
             }
         }
@@ -338,7 +350,9 @@ static void audio_duplex_task(void *arg)
             esp_audio_dec_in_raw_t raw = {.buffer = mic_opus, .len = (uint32_t)mop_len};
             esp_audio_dec_out_frame_t decf = {.buffer = mic_pcm, .len = MONO_PCM_BYTES};
             esp_audio_dec_info_t info = {0};
+            int64_t t0 = esp_timer_get_time();
             esp_audio_err_t derr = esp_opus_dec_decode(dec_hd, &raw, &decf, &info);
+            dec_us_sum += (uint64_t)(esp_timer_get_time() - t0);
             if (derr == ESP_AUDIO_ERR_OK && s_mic_rb) {
                 uint32_t out_bytes = decf.decoded_size > 0 ? decf.decoded_size : MONO_PCM_BYTES;
                 if (xRingbufferSend(s_mic_rb, mic_pcm, out_bytes, 0) == pdTRUE) {
@@ -358,9 +372,14 @@ static void audio_duplex_task(void *arg)
 
         slot++;
         if ((slot % 250) == 0 && (mic_ok > 0 || mic_err > 0 || spk_tx > 0)) {
-            ESP_LOGI(TAG, "Audio 5s: SpkTX=%lu, MicOK=%lu, MicErr=%lu",
-                     (unsigned long)spk_tx, (unsigned long)mic_ok, (unsigned long)mic_err);
+            ESP_LOGI(TAG, "Audio 5s: SpkTX=%lu (%.1fms), MicOK=%lu (%.1fms), MicErr=%lu",
+                     (unsigned long)spk_tx,
+                     spk_tx ? (double)enc_us_sum / spk_tx / 1000.0 : 0.0,
+                     (unsigned long)mic_ok,
+                     mic_ok ? (double)dec_us_sum / mic_ok / 1000.0 : 0.0,
+                     (unsigned long)mic_err);
             spk_tx = mic_ok = mic_err = 0;
+            enc_us_sum = dec_us_sum = 0;
         }
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(20));
     }
@@ -390,7 +409,8 @@ esp_err_t usb_bridge_init(void)
     }
 
     xTaskCreatePinnedToCore(usb_hid_task, "usb_hid", 3072, NULL, 5, NULL, 1);
-    xTaskCreatePinnedToCore(audio_duplex_task, "opus_duplex", 32768, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCoreWithCaps(audio_duplex_task, "opus_duplex", 49152, NULL, 3, NULL, 1,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     ESP_LOGI(TAG, "USB Bridge initialized (DS4 HID + UAC 2.0 + Core 1 Opus)");
     return ESP_OK;
 }
