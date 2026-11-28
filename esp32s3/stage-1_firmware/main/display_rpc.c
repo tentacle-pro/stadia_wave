@@ -2,6 +2,7 @@
 #include "game_session.h"
 #include "rtc_endpoint.h"
 #include "session_signaling.h"
+#include "usb_bridge.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,7 +44,7 @@ static uint32_t s_next_ticket = 1;
 static uint32_t s_get_state_ticket = 0;
 static display_rpc_input_cb_t s_input_cb = NULL;
 static stadia_controller_input_t s_last_input = {0};
-static bool s_mic_enabled = true;
+static bool s_mic_enabled = false;
 static uint32_t s_prev_buttons = 0;
 
 static bool dec_str_cb(pb_istream_t *stream, const pb_field_t *field, void **arg)
@@ -326,10 +327,9 @@ static void handle_controller_to_display_resp(uint32_t ticket, gotham_rpc_Status
             ESP_LOGI(TAG, ">>> MILESTONE: Display Link READY! <<<");
             ESP_LOGI(TAG, "  HW: mfg='%s', prod='%s', hw='%s', fw='%s', serial='%s', headset=%d",
                      mfg, prod, hw, fw, serial, s_last_input.headset_plugged);
-            ESP_LOGI(TAG, "Sending StartGame + AudioMode(2) + SetMic(true)...");
+            ESP_LOGI(TAG, "Sending StartGame + AudioMode(2) [PTT Mic ready, LED solid]...");
             display_rpc_send_start_game("stadia-wave-01");
             display_rpc_send_set_audio_mode(2, true);
-            display_rpc_send_set_microphone(true);
         }
         free(st);
     } else {
@@ -359,14 +359,18 @@ static void handle_controller_to_display_notif(const uint8_t *buf, size_t len)
             s_last_input.l2 = (uint8_t)m.f6;
             s_last_input.r2 = (uint8_t)m.f7;
 
-            // Assistant button (bit 10) toggles controller microphone (solid white LED when off)
+            // Standard PTT: hold Assistant (bit 10) to talk, release to mute (solid white LED)
             bool asst_now = (m.f1 & (1U << 10)) != 0;
             bool asst_prev = (s_prev_buttons & (1U << 10)) != 0;
             s_prev_buttons = m.f1;
-            if (asst_now && !asst_prev && s_ready) {
-                s_mic_enabled = !s_mic_enabled;
-                ESP_LOGI(TAG, "Assistant pressed -> Controller Mic %s",
-                         s_mic_enabled ? "ON (LED blinking)" : "OFF (LED solid)");
+            if (asst_now != asst_prev && s_ready) {
+                s_mic_enabled = asst_now;
+                if (s_mic_enabled) {
+                    usb_bridge_notify_mic_start();
+                }
+                ESP_LOGI(TAG, "PTT Assistant %s -> Controller Mic %s",
+                         asst_now ? "PRESSED" : "RELEASED",
+                         s_mic_enabled ? "ON" : "OFF");
                 display_rpc_send_set_microphone(s_mic_enabled);
             }
 

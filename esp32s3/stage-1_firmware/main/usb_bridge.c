@@ -57,6 +57,12 @@ static RingbufHandle_t s_spk_rb = NULL;
 static RingbufHandle_t s_mic_rb = NULL;
 static volatile bool s_mic_primed = false;
 static volatile bool s_spk_primed = false;
+static volatile int s_mic_mute_frames = 0;
+
+void usb_bridge_notify_mic_start(void)
+{
+    s_mic_mute_frames = 3;
+}
 
 static uint8_t map_dpad_hat(uint32_t btn)
 {
@@ -360,6 +366,10 @@ static void audio_duplex_task(void *arg)
             dec_us_sum += (uint64_t)(esp_timer_get_time() - t0);
             if (derr == ESP_AUDIO_ERR_OK && s_mic_rb) {
                 uint32_t out_bytes = decf.decoded_size > 0 ? decf.decoded_size : MONO_PCM_BYTES;
+                if (s_mic_mute_frames > 0) {
+                    s_mic_mute_frames--;
+                    memset(mic_pcm, 0, out_bytes);
+                }
                 if (xRingbufferSend(s_mic_rb, mic_pcm, out_bytes, 0) == pdTRUE) {
                     mic_ok++;
                     if (!s_mic_primed) {

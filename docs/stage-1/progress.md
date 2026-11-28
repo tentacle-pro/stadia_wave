@@ -70,4 +70,4 @@
     - 真机验证 `GameSession DTLS Connected` 与主机下发震动实测有效。
     - 在 [rtc_endpoint.c](file:///Users/dio/workspace/stadia_wave/esp32s3/stage-1_firmware/main/rtc_endpoint.c) 导出 DTLS-SRTP 密钥，实现 RFC 3711 `AES_128_CM_HMAC_SHA1_80` 加解密与 RTP 收发。
     - 在 [usb_bridge.c](file:///Users/dio/workspace/stadia_wave/esp32s3/stage-1_firmware/main/usb_bridge.c) 接入 Core 1 Opus 编解码任务（48kHz 2ch 编码 → 手柄耳机；手柄麦克风 → 48kHz 1ch 解码 → UAC Mic），并在 [display_rpc.c](file:///Users/dio/workspace/stadia_wave/esp32s3/stage-1_firmware/main/display_rpc.c) 自动下发 `SetAudioMode(2, true)` 与 `set_microphone(true)`。
-    - `idf.py build` 编译通过（`stadia_wireless_adapter.bin` = `0x148960` bytes）。
+    - 真机全双工调优与验收通过：缓存 SRTP PSA 密钥句柄、耳机改为 1ch Opus 编码 + 60ms 双向预缓冲，`Audio 5s` 实测稳定 **`SpkTX=250 (4.9~5.5ms), MicOK=250 (5.0ms), MicErr=0`**（双向满帧 50fps），并支持 **Assistant 语音键标准 PTT 模式**（开机默认静音白灯常亮，按住 `Assistant` 开麦并自动静音前 3 帧硬件咔嗒声，松开即停，适配 ASR / vibe coding）。
