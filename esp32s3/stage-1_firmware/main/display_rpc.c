@@ -182,43 +182,74 @@ static esp_err_t send_rpc_response(uint32_t ticket, gotham_rpc_StatusCode code,
     return ret;
 }
 
+static bool read_proto_field_hdr(pb_istream_t *is, uint32_t *field_num, uint32_t *wire_type)
+{
+    uint64_t tag = 0;
+    if (!pb_decode_varint(is, &tag)) {
+        return false;
+    }
+    *field_num = (uint32_t)(tag >> 3);
+    *wire_type = (uint32_t)(tag & 0x07);
+    return true;
+}
+
+static bool extract_oneof_submsg(const uint8_t *buf, size_t len,
+                                 uint32_t *out_tag, const uint8_t **out_sub, size_t *out_sub_len)
+{
+    pb_istream_t is = pb_istream_from_buffer(buf, len);
+    uint32_t fnum = 0, wtype = 0;
+    if (!read_proto_field_hdr(&is, &fnum, &wtype) || wtype != PB_WT_STRING) {
+        return false;
+    }
+    uint64_t slen = 0;
+    if (!pb_decode_varint(&is, &slen) || slen > is.bytes_left) {
+        return false;
+    }
+    *out_tag = fnum;
+    *out_sub = buf + (len - is.bytes_left);
+    *out_sub_len = (size_t)slen;
+    return true;
+}
+
 static void handle_controller_to_display_req(uint32_t ticket, const uint8_t *buf, size_t len)
 {
-    gotham_display_ControllerToDisplay *ctd = calloc(1, sizeof(gotham_display_ControllerToDisplay));
-    if (!ctd) return;
-
-    pb_istream_t is = pb_istream_from_buffer(buf, len);
-    if (!pb_decode(&is, gotham_display_ControllerToDisplay_fields, ctd)) {
-        ESP_LOGW(TAG, "CTD req decode failed: %s", PB_GET_ERROR(&is));
-        free(ctd);
+    uint32_t variant = 0;
+    const uint8_t *sub = NULL;
+    size_t sub_len = 0;
+    if (!extract_oneof_submsg(buf, len, &variant, &sub, &sub_len)) {
+        ESP_LOGW(TAG, "CTD req extract failed (len=%zu)", len);
         return;
     }
 
-    if (ctd->which_variant == gotham_display_ControllerToDisplay_get_current_time_tag) {
-        gotham_display_DisplayToController dtc = gotham_display_DisplayToController_init_zero;
-        dtc.has_current_time = true;
-        dtc.current_time.has_controller_time_us = true;
-        dtc.current_time.controller_time_us = ctd->variant.get_current_time.controller_time_us;
-        dtc.current_time.has_display_time_us = true;
-        dtc.current_time.display_time_us = 1764300000000000LL + esp_timer_get_time();
-        send_rpc_response(ticket, gotham_rpc_StatusCode_OK, &dtc);
-    } else if (ctd->which_variant == gotham_display_ControllerToDisplay_keepalive_tag) {
+    if (variant == gotham_display_ControllerToDisplay_get_current_time_tag) {
+        gotham_display_GetCurrentTimeRequest req = gotham_display_GetCurrentTimeRequest_init_zero;
+        pb_istream_t is = pb_istream_from_buffer(sub, sub_len);
+        if (pb_decode(&is, gotham_display_GetCurrentTimeRequest_fields, &req)) {
+            gotham_display_DisplayToController dtc = gotham_display_DisplayToController_init_zero;
+            dtc.has_current_time = true;
+            dtc.current_time.has_controller_time_us = true;
+            dtc.current_time.controller_time_us = req.controller_time_us;
+            dtc.current_time.has_display_time_us = true;
+            dtc.current_time.display_time_us = 1764300000000000LL + esp_timer_get_time();
+            send_rpc_response(ticket, gotham_rpc_StatusCode_OK, &dtc);
+        }
+    } else if (variant == gotham_display_ControllerToDisplay_keepalive_tag) {
         send_rpc_response(ticket, gotham_rpc_StatusCode_OK, NULL);
-    } else if (ctd->which_variant == gotham_display_ControllerToDisplay_disconnect_tag) {
-        ESP_LOGW(TAG, "Controller DisconnectRequest (reason=%lu)",
-                 (unsigned long)ctd->variant.disconnect.reason);
+    } else if (variant == gotham_display_ControllerToDisplay_disconnect_tag) {
+        gotham_display_DisconnectRequest dreq = gotham_display_DisconnectRequest_init_zero;
+        pb_istream_t is = pb_istream_from_buffer(sub, sub_len);
+        pb_decode(&is, gotham_display_DisconnectRequest_fields, &dreq);
+        ESP_LOGW(TAG, "Controller DisconnectRequest (reason=%lu)", (unsigned long)dreq.reason);
         send_rpc_response(ticket, gotham_rpc_StatusCode_OK, NULL);
         s_ready = false;
-    } else if (ctd->which_variant == gotham_display_ControllerToDisplay_proxy_request_tag) {
-        ESP_LOGI(TAG, "Controller ProxyRequest (ticket=%lu)", (unsigned long)ticket);
+    } else if (variant == gotham_display_ControllerToDisplay_proxy_request_tag) {
+        ESP_LOGI(TAG, "Controller ProxyRequest (ticket=%lu, len=%zu)", (unsigned long)ticket, sub_len);
         send_rpc_response(ticket, gotham_rpc_StatusCode_UNIMPLEMENTED, NULL);
     } else {
-        ESP_LOGD(TAG, "Unhandled CTD request variant=%d (ticket=%lu)",
-                 ctd->which_variant, (unsigned long)ticket);
+        ESP_LOGD(TAG, "Unhandled CTD request variant=%lu (ticket=%lu)",
+                 (unsigned long)variant, (unsigned long)ticket);
         send_rpc_response(ticket, gotham_rpc_StatusCode_UNIMPLEMENTED, NULL);
     }
-
-    free(ctd);
 }
 
 static void handle_controller_to_display_resp(uint32_t ticket, gotham_rpc_StatusCode code,
@@ -229,8 +260,18 @@ static void handle_controller_to_display_resp(uint32_t ticket, gotham_rpc_Status
             ESP_LOGW(TAG, "GetControllerStateResponse err=%d (retrying)", (int)code);
             return;
         }
-        gotham_display_ControllerToDisplay *ctd = calloc(1, sizeof(gotham_display_ControllerToDisplay));
-        if (!ctd) return;
+        uint32_t variant = 0;
+        const uint8_t *sub = NULL;
+        size_t sub_len = 0;
+        if (!extract_oneof_submsg(buf, len, &variant, &sub, &sub_len) ||
+            variant != gotham_display_ControllerToDisplay_controller_state_tag) {
+            ESP_LOGW(TAG, "GetControllerStateResponse unexpected variant=%lu", (unsigned long)variant);
+            return;
+        }
+
+        gotham_display_GetControllerStateResponse *st =
+            calloc(1, sizeof(gotham_display_GetControllerStateResponse));
+        if (!st) return;
 
         char dev_id[48] = {0};
         char mfg[32] = {0};
@@ -245,29 +286,28 @@ static void handle_controller_to_display_resp(uint32_t ticket, gotham_rpc_Status
         str_dec_t d_fw = {fw, sizeof(fw)};
         str_dec_t d_ser = {serial, sizeof(serial)};
 
-        ctd->variant.controller_state.device_id.funcs.decode = dec_str_cb;
-        ctd->variant.controller_state.device_id.arg = &d_dev;
-        ctd->variant.controller_state.f12.funcs.decode = dec_str_cb;
-        ctd->variant.controller_state.f12.arg = &d_mfg;
-        ctd->variant.controller_state.f14.funcs.decode = dec_str_cb;
-        ctd->variant.controller_state.f14.arg = &d_prod;
-        ctd->variant.controller_state.f15.funcs.decode = dec_str_cb;
-        ctd->variant.controller_state.f15.arg = &d_hw;
-        ctd->variant.controller_state.f16.funcs.decode = dec_str_cb;
-        ctd->variant.controller_state.f16.arg = &d_fw;
-        ctd->variant.controller_state.f17.funcs.decode = dec_str_cb;
-        ctd->variant.controller_state.f17.arg = &d_ser;
+        st->device_id.funcs.decode = dec_str_cb;
+        st->device_id.arg = &d_dev;
+        st->f12.funcs.decode = dec_str_cb;
+        st->f12.arg = &d_mfg;
+        st->f14.funcs.decode = dec_str_cb;
+        st->f14.arg = &d_prod;
+        st->f15.funcs.decode = dec_str_cb;
+        st->f15.arg = &d_hw;
+        st->f16.funcs.decode = dec_str_cb;
+        st->f16.arg = &d_fw;
+        st->f17.funcs.decode = dec_str_cb;
+        st->f17.arg = &d_ser;
 
-        pb_istream_t is = pb_istream_from_buffer(buf, len);
-        if (pb_decode(&is, gotham_display_ControllerToDisplay_fields, ctd) &&
-            ctd->which_variant == gotham_display_ControllerToDisplay_controller_state_tag) {
-            s_last_input.headset_plugged = ctd->variant.controller_state.f4;
+        pb_istream_t is = pb_istream_from_buffer(sub, sub_len);
+        if (pb_decode(&is, gotham_display_GetControllerStateResponse_fields, st)) {
+            s_last_input.headset_plugged = st->f4;
             s_ready = true;
             ESP_LOGI(TAG, ">>> MILESTONE: Display Link READY! <<<");
             ESP_LOGI(TAG, "  HW: mfg='%s', prod='%s', hw='%s', fw='%s', serial='%s', headset=%d",
                      mfg, prod, hw, fw, serial, s_last_input.headset_plugged);
         }
-        free(ctd);
+        free(st);
     } else {
         ESP_LOGI(TAG, "RPC Response ticket=%lu, code=%d, len=%zu",
                  (unsigned long)ticket, (int)code, len);
@@ -276,20 +316,24 @@ static void handle_controller_to_display_resp(uint32_t ticket, gotham_rpc_Status
 
 static void handle_controller_to_display_notif(const uint8_t *buf, size_t len)
 {
-    gotham_display_ControllerToDisplay *ctd = calloc(1, sizeof(gotham_display_ControllerToDisplay));
-    if (!ctd) return;
+    uint32_t variant = 0;
+    const uint8_t *sub = NULL;
+    size_t sub_len = 0;
+    if (!extract_oneof_submsg(buf, len, &variant, &sub, &sub_len)) {
+        return;
+    }
 
-    pb_istream_t is = pb_istream_from_buffer(buf, len);
-    if (pb_decode(&is, gotham_display_ControllerToDisplay_fields, ctd)) {
-        if (ctd->which_variant == gotham_display_ControllerToDisplay_message3_tag) {
-            const gotham_display_Message3 *m = &ctd->variant.message3;
-            s_last_input.buttons = m->f1;
-            s_last_input.lx = (int16_t)m->f2;
-            s_last_input.ly = (int16_t)m->f3;
-            s_last_input.rx = (int16_t)m->f4;
-            s_last_input.ry = (int16_t)m->f5;
-            s_last_input.l2 = (uint8_t)m->f6;
-            s_last_input.r2 = (uint8_t)m->f7;
+    pb_istream_t is = pb_istream_from_buffer(sub, sub_len);
+    if (variant == gotham_display_ControllerToDisplay_message3_tag) {
+        gotham_display_Message3 m = gotham_display_Message3_init_zero;
+        if (pb_decode(&is, gotham_display_Message3_fields, &m)) {
+            s_last_input.buttons = m.f1;
+            s_last_input.lx = (int16_t)m.f2;
+            s_last_input.ly = (int16_t)m.f3;
+            s_last_input.rx = (int16_t)m.f4;
+            s_last_input.ry = (int16_t)m.f5;
+            s_last_input.l2 = (uint8_t)m.f6;
+            s_last_input.r2 = (uint8_t)m.f7;
             if (s_input_cb) {
                 s_input_cb(&s_last_input);
             } else {
@@ -299,17 +343,22 @@ static void handle_controller_to_display_notif(const uint8_t *buf, size_t len)
                          s_last_input.rx, s_last_input.ry,
                          s_last_input.l2, s_last_input.r2);
             }
-        } else if (ctd->which_variant == gotham_display_ControllerToDisplay_audio_configuration_changed_tag) {
-            s_last_input.headset_plugged = (ctd->variant.audio_configuration_changed.mode != 0);
+        }
+    } else if (variant == gotham_display_ControllerToDisplay_audio_configuration_changed_tag) {
+        gotham_display_AudioConfigurationChanged ac = gotham_display_AudioConfigurationChanged_init_zero;
+        if (pb_decode(&is, gotham_display_AudioConfigurationChanged_fields, &ac)) {
+            s_last_input.headset_plugged = (ac.mode != 0);
             ESP_LOGI(TAG, "Headset jack: %s (mode=%lu)",
                      s_last_input.headset_plugged ? "PLUGGED" : "UNPLUGGED",
-                     (unsigned long)ctd->variant.audio_configuration_changed.mode);
-        } else if (ctd->which_variant == gotham_display_ControllerToDisplay_notification10_tag) {
-            s_last_input.battery_level = ctd->variant.notification10.value;
+                     (unsigned long)ac.mode);
+        }
+    } else if (variant == gotham_display_ControllerToDisplay_notification10_tag) {
+        gotham_display_FloatValue fv = gotham_display_FloatValue_init_zero;
+        if (pb_decode(&is, gotham_display_FloatValue_fields, &fv)) {
+            s_last_input.battery_level = fv.value;
             ESP_LOGI(TAG, "Battery: %.0f%%", s_last_input.battery_level * 100.0f);
         }
     }
-    free(ctd);
 }
 
 static void on_wire_rx(uint16_t msg_id, const uint8_t *payload, size_t len)
@@ -319,37 +368,40 @@ static void on_wire_rx(uint16_t msg_id, const uint8_t *payload, size_t len)
         return;
     }
 
-    uint8_t *inner = malloc(1024);
-    if (!inner) return;
-    bytes_dec_t pay_ctx = {.buf = inner, .cap = 1024, .len = 0};
-
-    gotham_rpc_RpcMessage rpc = gotham_rpc_RpcMessage_init_zero;
-    if (len > 0 && payload[0] == 0x0a) {
-        rpc.payload.request.payload.funcs.decode = dec_bytes_cb;
-        rpc.payload.request.payload.arg = &pay_ctx;
-    } else if (len > 0 && payload[0] == 0x12) {
-        rpc.payload.response.payload.funcs.decode = dec_bytes_cb;
-        rpc.payload.response.payload.arg = &pay_ctx;
-    } else if (len > 0 && payload[0] == 0x1a) {
-        rpc.payload.notification.payload.funcs.decode = dec_bytes_cb;
-        rpc.payload.notification.payload.arg = &pay_ctx;
-    }
-
-    pb_istream_t is = pb_istream_from_buffer(payload, len);
-    if (!pb_decode(&is, gotham_rpc_RpcMessage_fields, &rpc)) {
-        ESP_LOGW(TAG, "RpcMessage decode failed: %s", PB_GET_ERROR(&is));
-        free(inner);
+    uint32_t rpc_tag = 0;
+    const uint8_t *sub = NULL;
+    size_t sub_len = 0;
+    if (!extract_oneof_submsg(payload, len, &rpc_tag, &sub, &sub_len)) {
+        ESP_LOGW(TAG, "RpcMessage extract failed (len=%zu)", len);
         return;
     }
 
-    if (rpc.which_payload == gotham_rpc_RpcMessage_request_tag) {
-        handle_controller_to_display_req(rpc.payload.request.ticket, inner, pay_ctx.len);
-    } else if (rpc.which_payload == gotham_rpc_RpcMessage_response_tag) {
-        handle_controller_to_display_resp(rpc.payload.response.ticket,
-                                          rpc.payload.response.code,
-                                          inner, pay_ctx.len);
-    } else if (rpc.which_payload == gotham_rpc_RpcMessage_notification_tag) {
-        handle_controller_to_display_notif(inner, pay_ctx.len);
+    uint8_t *inner = malloc(1024);
+    if (!inner) return;
+    bytes_dec_t pay_ctx = {.buf = inner, .cap = 1024, .len = 0};
+    pb_istream_t is = pb_istream_from_buffer(sub, sub_len);
+
+    if (rpc_tag == gotham_rpc_RpcMessage_request_tag) {
+        gotham_rpc_RpcRequest req = gotham_rpc_RpcRequest_init_zero;
+        req.payload.funcs.decode = dec_bytes_cb;
+        req.payload.arg = &pay_ctx;
+        if (pb_decode(&is, gotham_rpc_RpcRequest_fields, &req)) {
+            handle_controller_to_display_req(req.ticket, inner, pay_ctx.len);
+        }
+    } else if (rpc_tag == gotham_rpc_RpcMessage_response_tag) {
+        gotham_rpc_RpcResponse resp = gotham_rpc_RpcResponse_init_zero;
+        resp.payload.funcs.decode = dec_bytes_cb;
+        resp.payload.arg = &pay_ctx;
+        if (pb_decode(&is, gotham_rpc_RpcResponse_fields, &resp)) {
+            handle_controller_to_display_resp(resp.ticket, resp.code, inner, pay_ctx.len);
+        }
+    } else if (rpc_tag == gotham_rpc_RpcMessage_notification_tag) {
+        gotham_rpc_RpcNotification notif = gotham_rpc_RpcNotification_init_zero;
+        notif.payload.funcs.decode = dec_bytes_cb;
+        notif.payload.arg = &pay_ctx;
+        if (pb_decode(&is, gotham_rpc_RpcNotification_fields, &notif)) {
+            handle_controller_to_display_notif(inner, pay_ctx.len);
+        }
     }
 
     free(inner);
