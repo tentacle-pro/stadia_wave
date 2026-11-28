@@ -313,6 +313,6 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(uac_device_init(&uac_cfg));
 
-    // Large stack (32KB) on Core 1 for Opus encoder/decoder
-    xTaskCreatePinnedToCore(audio_duplex_task, "opus_duplex", 32768, NULL, 5, NULL, 1);
+    // Large stack (64KB) on Core 1 for Opus CELT encoder/decoder
+    xTaskCreatePinnedToCore(audio_duplex_task, "opus_duplex", 65536, NULL, 5, NULL, 1);
 }
