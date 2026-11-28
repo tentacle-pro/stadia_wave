@@ -82,9 +82,12 @@ static uint8_t map_dpad_hat(uint32_t btn)
     return 8;
 }
 
+static volatile uint32_t s_hid_in_updates = 0;
+
 void usb_bridge_update_input(const stadia_controller_input_t *in)
 {
     if (!in) return;
+    s_hid_in_updates++;
 
     ds4_input_report_t next = {0};
     next.lx = (uint8_t)(((int32_t)in->lx + 32768) >> 8);
@@ -230,6 +233,8 @@ static void usb_hid_task(void *arg)
 {
     (void)arg;
     uint8_t seq = 0;
+    uint32_t sent_5s = 0;
+    uint32_t ticks = 0;
 
     while (1) {
         if (tud_mounted() && tud_hid_ready()) {
@@ -239,7 +244,9 @@ static void usb_hid_task(void *arg)
             portEXIT_CRITICAL(&s_lock);
 
             out.buttons2 = (out.buttons2 & 0x03) | (uint8_t)((seq++ & 0x3F) << 2);
-            tud_hid_report(0x01, &out, sizeof(out));
+            if (tud_hid_report(0x01, &out, sizeof(out))) {
+                sent_5s++;
+            }
         }
 
         if (s_rumble_dirty) {
@@ -249,6 +256,15 @@ static void usb_hid_task(void *arg)
             if (s_rumble_cb) {
                 s_rumble_cb(l, r);
             }
+        }
+
+        if (++ticks >= 500) {
+            ticks = 0;
+            ESP_LOGI(TAG, "HID 5s: sent=%lu, updates=%lu, mounted=%d, ready=%d",
+                     (unsigned long)sent_5s, (unsigned long)s_hid_in_updates,
+                     tud_mounted(), tud_hid_ready());
+            sent_5s = 0;
+            s_hid_in_updates = 0;
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -423,7 +439,8 @@ esp_err_t usb_bridge_init(void)
         return ret;
     }
 
-    xTaskCreatePinnedToCore(usb_hid_task, "usb_hid", 3072, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCoreWithCaps(usb_hid_task, "usb_hid", 4096, NULL, 4, NULL, 1,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     xTaskCreatePinnedToCoreWithCaps(audio_duplex_task, "opus_duplex", 49152, NULL, 3, NULL, 1,
                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     ESP_LOGI(TAG, "USB Bridge initialized (DS4 HID + UAC 2.0 + Core 1 Opus)");
